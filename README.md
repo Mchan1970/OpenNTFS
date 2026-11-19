@@ -39,21 +39,6 @@ release and a locally built copy (different signature) requires doing all
 three again. After replacing the app, eject and re-plug any mounted NTFS
 disk so it is served by the new extension.
 
-### Upgrading from 0.1.1
-
-0.2.0 has a new app identifier, so macOS treats it as a different app and
-none of the 0.1.1 grants carry over. Upgrade in this order:
-
-1. Eject every NTFS disk.
-2. In OpenNTFS 0.1.1, turn off "Privileged helper for Verify / Repair",
-   then quit the app.
-3. Delete the old `OpenNTFS.app` from `/Applications`, install 0.2.0 as
-   above and restart the Mac.
-4. Do the three grants above again. Under Full Disk Access, remove the old
-   OpenNTFS entry. If two entries with the same name are listed and you
-   cannot tell which one is the old one, remove both and add
-   `/Applications/OpenNTFS.app` again.
-
 ## Build and install from source
 
     brew install xcodegen

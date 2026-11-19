@@ -10,7 +10,7 @@
 #     build/install-<CONFIG>.log);
 #   * the bundle must contain the app, helper and extension executables, the
 #     app and extension Info.plist files and exactly one LaunchDaemon plist
-#     (layout as in the 0.1.1 release archive).
+#     (the layout of a release build).
 #
 # Install location (all names below are inside it):
 #   * .OpenNTFS-install.lock (a directory) makes runs mutually exclusive; it
