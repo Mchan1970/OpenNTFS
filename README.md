@@ -5,6 +5,11 @@ Read-write NTFS for macOS 27+ on Apple silicon, built as an FSKit file system ex
 [libntfs-3g](https://github.com/tuxera/ntfs-3g); this project adds a C bridge,
 the FSKit module and a menu bar app.
 
+Status: 0.2.0 is an early release. It has been tested on macOS 27.2 with a
+USB flash drive and with disk images. Other kinds of disks (external SSDs,
+hard drives) have not been tested, and no performance measurements have
+been made. Back up important data.
+
 ## Layout
 
 | Path | What |
@@ -13,8 +18,12 @@ the FSKit module and a menu bar app.
 | `Core/` | `ntfs_bridge` (inode based API over libntfs-3g), `ntfs_maint` (in-process mkntfs / ntfsfix), hand written `config.h` |
 | `Extension/` | FSKit module (`openntfs`) |
 | `App/` | menu bar app: volume list, mount / unmount / verify / repair |
+| `Helper/` | privileged helper (LaunchDaemon) that grants temporary access to a volume's device nodes for verify / repair |
+| `Shared/` | code used by more than one target: XPC protocol, constants, device path rules, UI strings |
+| `Makefile` | builds the core and the command line tools outside Xcode; offline tests |
 | `Tools/ntfstool.c` | command line tool that drives the bridge on a disk image, incl. a randomized stress test |
 | `Tools/install.sh` | build, install to /Applications, avoid duplicate registrations |
+| `Tools/` (other) | offline test programs and scripts, `icon/` (generates the app icon), `release/` (export options and the `SOURCE.txt` template for release archives) |
 
 ## Install a release
 
@@ -25,7 +34,10 @@ and notarized), unzip it, move `OpenNTFS-<version>/OpenNTFS.app` to
 `/Applications` and open it. The archive also contains the license and a
 `SOURCE.txt` that points to the matching source code. Then, once:
 
-1. Enable the file system extension (see below).
+1. Enable the file system extension: System Settings → General → Login
+   Items & Extensions → Extensions **By Category** → File System Extensions →
+   OpenNTFS. (The toggle in the "By App" view fails with EPERM on macOS
+   27.2.)
 2. In the app, turn on "Privileged helper for Verify / Repair" and allow
    OpenNTFS under System Settings → General → Login Items & Extensions →
    Allow in the Background.
@@ -33,6 +45,10 @@ and notarized), unzip it, move `OpenNTFS-<version>/OpenNTFS.app` to
    Security → Full Disk Access. Without it the helper cannot change the
    owner of USB device nodes and Verify / Repair fails with "Operation not
    permitted".
+
+Once the extension is enabled, DiskArbitration mounts NTFS volumes with
+OpenNTFS automatically under `/Volumes`. Turn it off in the same panel to go
+back to the system's read-only driver.
 
 These grants are tied to the app's code signature. Switching between a
 release and a locally built copy (different signature) requires doing all
@@ -44,13 +60,8 @@ disk so it is served by the new extension.
     brew install xcodegen
     Tools/install.sh
 
-Then enable the module: System Settings → General → Login Items & Extensions →
-Extensions **By Category** → File System Extensions → OpenNTFS.
-(The toggle in the "By App" view fails with EPERM on macOS 27.2.)
-
-Once enabled, DiskArbitration mounts NTFS volumes with OpenNTFS automatically
-under `/Volumes`. Turn the module off in the same panel to go back to the
-system's read-only driver.
+Then enable the extension and do the grants as described under "Install a
+release" above.
 
 For a release build use `CONFIG=Release Tools/install.sh`.
 
@@ -123,6 +134,20 @@ your user account.
     build/ntfstool t.img format Test
     build/ntfstool t.img stress 1 3000
 
+Offline tests (they use disposable files under `build/` or recording stubs and
+do not touch real disks, `/Volumes` or `/Applications`):
+
+| Target | What it checks |
+|---|---|
+| `make maint-repair-test` | verify / repair engine (ntfsfix through `ntfstool`) on a disk image |
+| `make ntfstool-cmd-test` | `ntfstool` rejects unknown commands before opening the image |
+| `make install-script-test` | `Tools/install.sh` with stubbed build and system tools |
+| `make lease-store-test` | the helper's grant journal, device checks and remount policy |
+| `make lease-store-scene-selfcheck` | that failed `lease-store-test` runs keep their files for inspection |
+| `make app-orchestration-test` | the app's verify / repair / remount flow with stubbed commands |
+| `make app-orchestration-stub-selfcheck` | that the stubs of `app-orchestration-test` catch violations |
+| `make da-qual-offline` | the DiskArbitration fact sampler on example fixtures (no real DiskArbitration session) |
+
 ## Behaviour notes
 
 - Case insensitive, case preserving. Names are stored NFC.
@@ -138,6 +163,9 @@ your user account.
   intended: like upstream ntfsfix, the repair marks the volume dirty so that
   Windows runs its full chkdsk once. Let it scan. (A verify does not set the
   flag.)
+- The app's interface is in Simplified Chinese when the first language in
+  the system's preferred languages is any Chinese variant, and in English
+  otherwise.
 - File data goes through user space; FSKit kernel-offloaded I/O is not
   implemented yet.
 
