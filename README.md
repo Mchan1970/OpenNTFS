@@ -5,10 +5,10 @@ Read-write NTFS for macOS 27+ on Apple silicon, built as an FSKit file system ex
 [libntfs-3g](https://github.com/tuxera/ntfs-3g); this project adds a C bridge,
 the FSKit module and a menu bar app.
 
-Status: 0.2.0 is an early release. It has been tested on macOS 27.2 with a
-USB flash drive and with disk images. Other kinds of disks (external SSDs,
-hard drives) have not been tested, and no performance measurements have
-been made. Back up important data.
+Status: 0.2.0 is an early release. It has been tested on a single Mac
+(macOS 27.2) with a USB flash drive and with disk images. Other kinds of
+disks (external SSDs, hard drives) have not been tested, and no performance
+measurements have been made. Back up important data.
 
 ## Layout
 
