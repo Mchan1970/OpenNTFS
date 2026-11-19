@@ -1,0 +1,8 @@
+{
+  "session": "ok", "disk": "ok", "description": "ok",
+  "echoBSDName": "disk9s1",
+  "values": {
+    "MediaBSDName": {"type": "string", "value": "disk9s1"},
+    "MediaLeaf": {"type": "bool", "value": true}
+  }
+}

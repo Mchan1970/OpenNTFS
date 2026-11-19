@@ -1,0 +1,16 @@
+{
+  "session": "ok", "disk": "ok", "description": "ok",
+  "echoBSDName": "disk9s1",
+  "values": {
+    "VolumeKind": {"type": "string", "value": "ntfs"},
+    "VolumeName": {"type": "string", "value": "EXAMPLE"},
+    "VolumePath": {"type": "url", "value": "/Volumes/EXAMPLE"},
+    "VolumeMountable": {"type": "bool", "value": true},
+    "MediaBSDName": {"type": "string", "value": "disk9s1"},
+    "MediaBSDMajor": {"type": "number", "value": 1},
+    "MediaBSDMinor": {"type": "number", "value": 9},
+    "MediaLeaf": {"type": "bool", "value": true},
+    "MediaWhole": {"type": "bool", "value": false},
+    "MediaWritable": {"type": "bool", "value": true}
+  }
+}

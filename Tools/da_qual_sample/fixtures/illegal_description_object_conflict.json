@@ -1,0 +1,5 @@
+{
+  "session": "ok", "disk": "ok", "description": "ok",
+  "descriptionObject": "non-dictionary",
+  "values": { "MediaLeaf": {"type": "bool", "value": true} }
+}

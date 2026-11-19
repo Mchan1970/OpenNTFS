@@ -1,0 +1,146 @@
+name: OpenNTFS
+options:
+  bundleIdPrefix: io.github.mchan1970
+  deploymentTarget:
+    macOS: "27.0"
+  createIntermediateGroups: true
+configs:
+  Debug: debug
+  Release: release
+settings:
+  base:
+    DEVELOPMENT_TEAM: 265UPCYPZ6
+    CODE_SIGN_STYLE: Automatic
+    MARKETING_VERSION: "0.2.0"
+    CURRENT_PROJECT_VERSION: "5"
+    SWIFT_VERSION: "5.0"
+    ENABLE_HARDENED_RUNTIME: YES
+    DEAD_CODE_STRIPPING: YES
+    # __FILE__ in C code (ntfs-3g logging, assert) becomes relative to the
+    # source root, so no build-machine path is embedded in the binaries.
+    OTHER_CFLAGS: ["$(inherited)", "-fmacro-prefix-map=$(SRCROOT)/="]
+targets:
+  NTFSCore:
+    type: library.static
+    platform: macOS
+    sources:
+      - path: Core
+      - path: Vendor/ntfs-3g/libntfs-3g
+        includes: ["*.c"]
+        excludes: ["win32_io.c"]
+      - path: Vendor/ntfs-3g/ntfsprogs/mkntfs.c
+        compilerFlags: "-DNTFS_MAINT -Dmain=mkntfs_main"
+      - path: Vendor/ntfs-3g/ntfsprogs/ntfsfix.c
+        compilerFlags: "-DNTFS_MAINT -Dmain=ntfsfix_main"
+      - path: Vendor/ntfs-3g/ntfsprogs/utils.c
+        compilerFlags: "-DNTFS_MAINT"
+      - path: Vendor/ntfs-3g/ntfsprogs/boot.c
+      - path: Vendor/ntfs-3g/ntfsprogs/attrdef.c
+      - path: Vendor/ntfs-3g/ntfsprogs/sd.c
+    settings:
+      base:
+        HEADER_SEARCH_PATHS:
+          - $(SRCROOT)/Core
+          - $(SRCROOT)/Vendor/ntfs-3g/include/ntfs-3g
+          - $(SRCROOT)/Vendor/ntfs-3g/include
+          - $(SRCROOT)/Vendor/ntfs-3g/ntfsprogs
+        GCC_PREPROCESSOR_DEFINITIONS: ["$(inherited)", "HAVE_CONFIG_H=1"]
+        GCC_WARN_INHIBIT_ALL_WARNINGS: YES
+        CLANG_ENABLE_MODULES: NO
+        SKIP_INSTALL: YES
+  OpenNTFSModule:
+    type: extensionkit-extension
+    platform: macOS
+    sources:
+      - path: Extension
+    dependencies:
+      - target: NTFSCore
+      - sdk: FSKit.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.mchan1970.OpenNTFS.FSModule
+        PRODUCT_NAME: OpenNTFSModule
+        INFOPLIST_FILE: Extension/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_ENTITLEMENTS: Extension/Extension.entitlements
+        SWIFT_OBJC_BRIDGING_HEADER: Extension/Bridging-Header.h
+        HEADER_SEARCH_PATHS: ["$(SRCROOT)/Core"]
+        ENABLE_APP_SANDBOX: YES
+  # Privileged LaunchDaemon: fsck_fskit / newfs_fskit against /dev/rdisk*
+  # (SMAppService + XPC). Embedded under Contents/MacOS; plist under
+  # Contents/Library/LaunchDaemons.
+  OpenNTFSHelper:
+    type: tool
+    platform: macOS
+    sources:
+      - path: Helper
+        excludes:
+          - "LaunchDaemons/**"
+          - "Bridging-Header.h"
+      - path: Shared
+    dependencies:
+      # Qualification gate (Helper/DeviceQualification.swift) uses the DA
+      # SDK directly; explicit sdk dependency so linking never relies on
+      # Swift auto-linking alone.
+      - sdk: DiskArbitration.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.mchan1970.OpenNTFS.Helper
+        PRODUCT_NAME: OpenNTFSHelper
+        # Embedded in OpenNTFS.app (Contents/MacOS) via the app's copy phase.
+        # Installing it on its own puts /usr/local/bin/OpenNTFSHelper into the
+        # archive and turns it into a generic archive (no Developer ID export).
+        SKIP_INSTALL: YES
+        # A bare executable cannot embed a provisioning profile. Automatic
+        # signing gave it one anyway, adding com.apple.application-identifier;
+        # under Developer ID, AMFI then killed the daemon at launch ("Failure
+        # validating against provisioning profiles"). Sign it manually,
+        # without a profile. Developer ID export re-signs it with the
+        # distribution identity.
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "Apple Development"
+        PROVISIONING_PROFILE_SPECIFIER: ""
+        # Manual signing alone still generated application-identifier
+        # (ENTITLEMENTS_REQUIRED defaults to YES with a team set).
+        ENTITLEMENTS_REQUIRED: NO
+        GENERATE_INFOPLIST_FILE: YES
+        ENABLE_APP_SANDBOX: NO
+        SWIFT_OBJC_BRIDGING_HEADER: Helper/Bridging-Header.h
+        HEADER_SEARCH_PATHS: ["$(SRCROOT)/Helper"]
+        OTHER_LDFLAGS: ["-lbsm"]
+  OpenNTFS:
+    type: application
+    platform: macOS
+    sources:
+      - path: App
+      - path: Shared
+      - path: Helper/LaunchDaemons
+        buildPhase:
+          copyFiles:
+            destination: wrapper
+            subpath: Contents/Library/LaunchDaemons
+      # GPL: the license travels inside the signed app (Contents/Resources).
+      - path: LICENSE
+        buildPhase: resources
+    dependencies:
+      - target: OpenNTFSModule
+        embed: true
+      - target: OpenNTFSHelper
+        codeSign: true
+        copy:
+          destination: executables
+      - sdk: FSKit.framework
+      - sdk: DiskArbitration.framework
+      - sdk: ServiceManagement.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.mchan1970.OpenNTFS
+        PRODUCT_NAME: OpenNTFS
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_LSUIElement: YES
+        INFOPLIST_KEY_CFBundleDisplayName: OpenNTFS
+        # App/Assets.xcassets/AppIcon.appiconset, generated by Tools/icon/make_icon.swift
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        INFOPLIST_KEY_NSHumanReadableCopyright: "GPL-2.0-or-later. Built on libntfs-3g."
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.utilities
+        ENABLE_APP_SANDBOX: NO

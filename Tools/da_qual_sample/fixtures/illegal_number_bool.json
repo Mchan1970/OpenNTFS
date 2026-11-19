@@ -1,0 +1,2 @@
+{ "session": "ok", "disk": "ok", "description": "ok",
+  "values": { "MediaBSDMajor": {"type": "number", "value": true} } }

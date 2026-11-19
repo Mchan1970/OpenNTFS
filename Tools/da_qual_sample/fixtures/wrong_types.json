@@ -1,0 +1,11 @@
+{
+  "session": "ok", "disk": "ok", "description": "ok",
+  "echoBSDName": "disk9s1",
+  "values": {
+    "VolumeKind": {"type": "bool", "value": true},
+    "MediaLeaf": {"type": "string", "value": "yes"},
+    "MediaBSDMajor": {"type": "string", "value": "1"},
+    "MediaBSDMinor": {"type": "bool", "value": false},
+    "VolumePath": {"type": "string", "value": "/Volumes/not-a-url-type"}
+  }
+}

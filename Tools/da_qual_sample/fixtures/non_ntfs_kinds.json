@@ -1,0 +1,9 @@
+{
+  "session": "ok", "disk": "ok", "description": "ok",
+  "echoBSDName": "disk9s1",
+  "values": {
+    "VolumeKind": {"type": "string", "value": "exfat"},
+    "MediaLeaf": {"type": "bool", "value": true},
+    "MediaWhole": {"type": "bool", "value": false}
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "session": "ok", "disk": "ok", "description": "ok",
+  "echoBSDName": "disk9s1",
+  "values": {
+    "VolumeKind": {"type": "string", "value": "ntfs"},
+    "VolumeName": {"type": "string", "value": "EXAMPLE"},
+    "VolumeUUID": {"type": "uuid", "value": "1F2E3D4C-5B6A-4958-8776-657483852690"},
+    "VolumeMountable": {"type": "bool", "value": true},
+    "VolumeNetwork": {"type": "bool", "value": false},
+    "MediaBSDName": {"type": "string", "value": "disk9s1"},
+    "MediaBSDMajor": {"type": "number", "value": 1},
+    "MediaBSDMinor": {"type": "number", "value": 9},
+    "MediaBSDUnit": {"type": "number", "value": 9},
+    "MediaBlockSize": {"type": "number", "value": 512},
+    "MediaLeaf": {"type": "bool", "value": true},
+    "MediaWhole": {"type": "bool", "value": false},
+    "MediaPath": {"type": "string", "value": "/dev/disk9s1"},
+    "MediaSize": {"type": "number", "value": 67108864},
+    "MediaWritable": {"type": "bool", "value": true},
+    "MediaEjectable": {"type": "bool", "value": true},
+    "MediaRemovable": {"type": "bool", "value": true},
+    "DevicePath": {"type": "string", "value": "/Library/Extensions/placeholder.kext"},
+    "DeviceInternal": {"type": "bool", "value": false},
+    "DeviceModel": {"type": "string", "value": "EXAMPLE-IMAGE"},
+    "DeviceProtocol": {"type": "string", "value": "Virtual Interface"},
+    "DeviceVendor": {"type": "string", "value": "EXAMPLE"},
+    "BusName": {"type": "string", "value": "EXAMPLEBUS"},
+    "BusPath": {"type": "string", "value": "IOService:/EXAMPLE"}
+  }
+}

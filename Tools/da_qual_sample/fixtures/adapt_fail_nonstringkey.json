@@ -1,0 +1,4 @@
+{
+  "session": "ok", "disk": "ok", "description": "ok",
+  "descriptionObject": "non-string-key-dict"
+}

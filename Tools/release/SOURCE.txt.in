@@ -1,0 +1,22 @@
+OpenNTFS @VERSION@ - corresponding source code
+==============================================
+
+This archive contains OpenNTFS.app, built from:
+
+  Source:   https://github.com/Mchan1970/OpenNTFS/tree/v@VERSION@
+  Commit:   @COMMIT@
+
+OpenNTFS is free software, licensed under the GNU General Public License,
+version 2 or (at your option) any later version. See the LICENSE file next to
+this one (also included inside the app at Contents/Resources/LICENSE).
+
+The NTFS engine is libntfs-3g, which is also licensed under GPL-2.0-or-later:
+
+  https://github.com/tuxera/ntfs-3g
+
+A copy of the libntfs-3g sources used for this build is part of the
+OpenNTFS source tree above (Vendor/ntfs-3g), with its original copyright
+notices.
+
+To build from source, see the section "Build and install from source" in
+README.md of the source tree.

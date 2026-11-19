@@ -1,0 +1,7 @@
+Upstream: https://github.com/tuxera/ntfs-3g.git
+Tag:      2026.9.28
+Commit:   7f0f841fc52cf719106c5c93bafe465004e36816
+
+Vendored as a plain source tree; the upstream .git directory was removed
+after cloning (shallow, at the tag above, no local modifications).
+To update: re-clone, check out the new tag, and replace this directory.

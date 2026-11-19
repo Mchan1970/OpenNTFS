@@ -1,0 +1,15 @@
+{
+  "session": "ok", "disk": "ok", "description": "ok", "keyMode": "verbatim",
+  "echoBSDName": "disk9s1",
+  "values": {
+    "DAVolumeKind": {"type": "string", "value": "ntfs"},
+    "DAVolumeName": {"type": "string", "value": "EXAMPLE"},
+    "DAVolumeMountable": {"type": "bool", "value": true},
+    "DAMediaBSDName": {"type": "string", "value": "disk9s1"},
+    "DAMediaBSDMajor": {"type": "number", "value": 1},
+    "DAMediaBSDMinor": {"type": "number", "value": 9},
+    "DAMediaLeaf": {"type": "bool", "value": true},
+    "DAMediaWhole": {"type": "bool", "value": false},
+    "DAVolumePath": {"type": "url", "value": "/Volumes/EXAMPLE"}
+  }
+}
