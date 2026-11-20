@@ -81,10 +81,10 @@ final class NTFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
     func unloadResource(resource: FSResource, options: FSTaskOptions,
                         replyHandler reply: @escaping ((any Error)?) -> Void) {
         log.info("unloading")
-        volume?.shutdown()
+        let status = volume?.shutdown() ?? 0
         volume = nil
         self.resource = nil
-        reply(nil)
+        reply(status == 0 ? nil : posixError(status))
     }
 
     func didFinishLoading() {
@@ -107,28 +107,37 @@ extension NTFSFileSystem: FSManageableResourceMaintenanceOperations {
         throws -> Progress {
         guard let block = resource else { throw posixError(ENXIO) }
         if needsWrite && !block.isWritable { throw posixError(EROFS) }
-        // The NTFS volume must not be open while a tool works on the device.
-        volume?.shutdown()
-        volume = nil
-
-        let progress = Progress(totalUnitCount: 100)
-        DispatchQueue.global(qos: .userInitiated).async {
-            let device = BlockDevice(resource: block, readOnly: !needsWrite)
-            let output = TaskOutput(task)
-            var io = device.io
-            let rc: Int32 = Core.sync {
-                work(&io, Unmanaged.passUnretained(output).toOpaque())
+        // The NTFS volume must not be open while a tool works on the
+        // device, and a volume that did not shut down cleanly must not be
+        // checked, repaired or formatted on top of its remains: the task
+        // is only scheduled inside the gate.
+        var scheduled: Progress?
+        let gate = VolumeErrorState.gateMaintenance(shutdownResult: volume?.shutdown() ?? 0) {
+            volume = nil
+            let progress = Progress(totalUnitCount: 100)
+            DispatchQueue.global(qos: .userInitiated).async {
+                let device = BlockDevice(resource: block, readOnly: !needsWrite)
+                let output = TaskOutput(task)
+                var io = device.io
+                let rc: Int32 = Core.sync {
+                    work(&io, Unmanaged.passUnretained(output).toOpaque())
+                }
+                progress.completedUnitCount = 100
+                log.info("\(name, privacy: .public) finished with status \(rc)")
+                if rc == 0 {
+                    task.didComplete(error: nil)
+                } else {
+                    task.logMessage("\(name) failed with status \(rc)")
+                    task.didComplete(error: rc < 0 ? posixError(rc) : fs_errorForPOSIXError(EIO))
+                }
             }
-            progress.completedUnitCount = 100
-            log.info("\(name, privacy: .public) finished with status \(rc)")
-            if rc == 0 {
-                task.didComplete(error: nil)
-            } else {
-                task.logMessage("\(name) failed with status \(rc)")
-                task.didComplete(error: rc < 0 ? posixError(rc) : fs_errorForPOSIXError(EIO))
-            }
+            scheduled = progress
         }
-        return progress
+        if gate != 0 {
+            volume = nil
+            throw posixError(gate)
+        }
+        return scheduled ?? Progress(totalUnitCount: 100)
     }
 
     private static let forward: ntfsm_output_cb = { ctx, line in

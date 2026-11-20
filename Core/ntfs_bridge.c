@@ -71,6 +71,23 @@ struct ntfsb_volume {
 	 * exposes stale disk content.
 	 */
 	s64 w_size;
+	/*
+	 * Error ledger: the earliest flush error that has not
+	 * been handed to a caller able to report it. 0 means none. Only
+	 * ntfsb_sync() and ntfsb_unmount() consume it: a boundary reports
+	 * the stored error when one is pending and otherwise its own
+	 * attempt's result. Every later failure is only logged.
+	 */
+	int pending_err;
+	/*
+	 * Fail-closed marker: a trim failed half way, so bitmap,
+	 * runlist and attribute sizes are already partially updated on disk
+	 * and in memory. Retrying could skip the mapping pair update and
+	 * leave clusters free in $Bitmap while an MFT record still references
+	 * them. While set (positive errno) every modifying operation, write
+	 * and sync fails; read-only access keeps working.
+	 */
+	int fatal_err;
 };
 
 #define PREALLOC_MIN	(16LL << 20)
@@ -140,6 +157,12 @@ void ntfsb_set_log_callback(ntfsb_log_cb cb, int min_level)
 struct bdev {
 	ntfsb_device io;
 	s64 pos;
+	/*
+	 * Errno of the last failed device write, recorded because
+	 * ntfs_inode_sync_in_dir() collapses every non-EIO write error
+	 * into EBUSY and the real reason would be lost otherwise.
+	 */
+	int last_werr;
 };
 
 #define BDEV(dev) ((struct bdev *)(dev)->d_private)
@@ -161,10 +184,17 @@ static s64 bdev_xfer(struct bdev *b, void *buf, s64 count, s64 offset,
 					count - done, offset + done);
 		if (r < 0) {
 			errno = (int)-r;
+			if (writing)
+				b->last_werr = errno;
 			return -1;
 		}
-		if (r == 0)
+		if (r == 0) {
+			/* a write that makes no progress must not look like
+			 * success. */
+			if (writing)
+				b->last_werr = EIO;
 			break;
+		}
 		done += r;
 	}
 	return done;
@@ -886,34 +916,179 @@ static int neg_errno(void)
 /* Write cache                                                            */
 /* ====================================================================== */
 
-/* Close the cached file, which writes its metadata out. */
+/*
+ * Record a failure in the error ledger: only the earliest
+ * unreported error is kept, later ones just go to the log.
+ * @nerr is a negative errno, as everywhere in the bridge.
+ */
+static void ledger_record(ntfsb_volume *v, int nerr)
+{
+	if (!v->pending_err) {
+		v->pending_err = -nerr;
+		ntfs_log_error("volume error ledger: remembering %s, it will "
+			"be reported at the next boundary\n", strerror(-nerr));
+	}
+}
+
+/*
+ * Consume the ledger at a reporting boundary (ntfsb_sync /
+ * ntfsb_unmount). @pre is the ledger content from BEFORE
+ * this attempt ran (wcache_flush() itself records its failure when the
+ * ledger was empty), @cur is this attempt's own negative errno or 0.
+ * Returns the negative errno to report:
+ *   ledger empty before, attempt ok    -> 0
+ *   ledger empty before, failed E2     -> E2, reported and consumed
+ *   ledger E1 before,    attempt ok    -> E1, ledger emptied
+ *   ledger E1 before,    failed E2     -> E1, E2 kept unreported
+ */
+static int ledger_report(ntfsb_volume *v, int pre, int cur)
+{
+	if (pre) {
+		v->pending_err = cur ? -cur : 0;
+		return -pre;
+	}
+	v->pending_err = 0;
+	return cur;
+}
+
+/*
+ * Close the cached file: first give back the space that was
+ * allocated ahead, then write the metadata out, and only after both
+ * succeeded release the attribute and the inode. On failure the cache
+ * is left exactly as it was - w_ni, w_na (still open) and w_size - and
+ * the error is recorded in the ledger, so the next flush retries from
+ * the trim and the file never exists twice in memory. Only retryable
+ * failures come back here: after a failed trim the volume is
+ * fail-closed and the flush returns without writing anything.
+ */
 static int wcache_flush_why(ntfsb_volume *v, const char *why)
 {
-	int ret = 0;
+	struct bdev *bdev;
+	int ret;
 
+	/* fail closed after a half-finished trim: nothing is
+	 * written any more, the error behaves like a failing attempt at
+	 * every boundary */
+	if (v->fatal_err)
+		return -v->fatal_err;
 	if (!v->w_ni)
 		return 0;
+	bdev = BDEV(v->vol->dev);
 	ntfs_log_info("wcache flush by %s: inode %lld size %lld prealloc %lld\n",
 		why, (long long)v->w_ni->mft_no, (long long)v->w_size,
 		(long long)(v->w_na ? v->w_na->data_size - v->w_size : 0));
-	if (v->w_na) {
-		/* give back what was allocated ahead but never written */
-		if (v->w_na->data_size > v->w_size
-		    && ntfs_attr_truncate(v->w_na, v->w_size)) {
-			ret = neg_errno();
-			ntfs_log_perror("Failed to trim preallocated space of "
-				"inode %lld", (long long)v->w_ni->mft_no);
-		}
-		ntfs_attr_close(v->w_na);
-	}
-	v->w_na = NULL;
-	if (ntfs_inode_close(v->w_ni) && !ret)
+
+	/* step 1: give back what was allocated ahead but never written.
+	 * A failure here is NOT retryable: the truncate frees
+	 * $Bitmap clusters and rewrites sizes before it updates the mapping
+	 * pairs, so a retry could skip that update and leave the freed
+	 * clusters cross-allocated. The volume fails closed instead. */
+	if (v->w_na && v->w_na->data_size > v->w_size
+	    && ntfs_attr_truncate(v->w_na, v->w_size)) {
 		ret = neg_errno();
+		ntfs_log_perror("Failed to trim preallocated space of "
+			"inode %lld", (long long)v->w_ni->mft_no);
+		if (!v->fatal_err)
+			v->fatal_err = -ret;
+		ledger_record(v, ret);
+		return ret;
+	}
+
+	/* step 2: write the metadata out; nothing is released yet. A failed
+	 * sync puts the dirty marks back (inode.c), so a retry commits
+	 * again. */
+	bdev->last_werr = 0;
+	if (ntfs_inode_sync(v->w_ni)) {
+		ret = neg_errno();
+		/* ntfs_inode_sync_in_dir() maps every non-EIO write error
+		 * to EBUSY. The write itself went through this bridge's
+		 * device ops, which remembered the real errno; report that
+		 * one, the error ledger needs to tell errors apart. */
+		if (ret == -EBUSY && bdev->last_werr)
+			ret = -bdev->last_werr;
+		ntfs_log_perror("Failed to sync inode %lld to disk",
+			(long long)v->w_ni->mft_no);
+		/* the sync may already have cleared the FILE_NAME mark
+		 * after a swallowed index write: re-file it, so the
+		 * retry updates the directory entry as well. Writing an
+		 * entry that may already be on disk is safe. */
+		NInoFileNameSetDirty(v->w_ni);
+		ledger_record(v, ret);
+		return ret;
+	}
+
+	/* The sync reported success, but a write inside it may have failed
+	 * silently: the vendored index code discards failed writes of
+	 * non-resident $I30 blocks (index.c ntfs_index_ctx_put), losing the
+	 * directory entry update. Any failed device write during the sync
+	 * fails the sync; the file name mark was already
+	 * cleared by the sync, so it is set again for the retry. */
+	if (bdev->last_werr) {
+		ret = -bdev->last_werr;
+		ntfs_log_error("a write during the sync of inode %lld failed "
+			"silently (%s); keeping the cache for a retry\n",
+			(long long)v->w_ni->mft_no, strerror(-ret));
+		NInoFileNameSetDirty(v->w_ni);
+		ledger_record(v, ret);
+		return ret;
+	}
+
+	/* step 3: the inode is clean now, so releasing it cannot fail (the
+	 * inode cache branch only fails when a sync is needed). If the
+	 * invariant is broken anyway, clear the pointers: the worst case
+	 * is a leak, keeping them could leave a dangling inode behind. */
+	if (v->w_na) {
+		ntfs_attr_close(v->w_na);
+		v->w_na = NULL;
+	}
+	ret = 0;
+	if (ntfs_inode_close(v->w_ni)) {
+		ret = neg_errno();
+		ntfs_log_error("Failed to close synced inode %lld: leaking it, "
+			"cache cleared\n", (long long)v->w_ni->mft_no);
+		ledger_record(v, ret);
+	}
 	v->w_ni = NULL;
 	return ret;
 }
 
 #define wcache_flush(v) wcache_flush_why(v, __func__)
+
+/*
+ * Abandon path, unmount only: the flush still fails, so the
+ * memory lifecycle of the write cache ends without any further writes.
+ * Only the inode the write cache owns is reclaimed: its dirty marks
+ * (and those of its extents) are dropped, then it is really closed,
+ * which frees it. The last metadata update of the file
+ * is lost and the on-disk state may be partially committed; only the
+ * memory is reclaimed.
+ */
+static void wcache_abandon(ntfsb_volume *v)
+{
+	ntfs_inode *ni = v->w_ni;
+	int i;
+
+	if (!ni)
+		return;
+	ntfs_log_error("abandoning the write cache of inode %lld at unmount: "
+		"its pending metadata update is lost\n",
+		(long long)ni->mft_no);
+	if (v->w_na) {
+		ntfs_attr_close(v->w_na);
+		v->w_na = NULL;
+	}
+	NInoClearDirty(ni);
+	NInoAttrListClearDirty(ni);
+	NInoFileNameClearDirty(ni);
+	for (i = 0; i < ni->nr_extents; i++) {
+		NInoClearDirty(ni->extent_nis[i]);
+		NInoAttrListClearDirty(ni->extent_nis[i]);
+		NInoFileNameClearDirty(ni->extent_nis[i]);
+	}
+	/* cannot fail anymore: nothing is dirty, so nothing is written */
+	ntfs_inode_real_close(ni);
+	v->w_ni = NULL;
+}
 
 /* Open an inode, borrowing the cached one when it is the same file. */
 static ntfs_inode *ni_open(ntfsb_volume *v, u64 ino)
@@ -1165,24 +1340,45 @@ fail:
 int ntfsb_unmount(ntfsb_volume *v)
 {
 	struct ntfs_device *dev;
+	void *priv;
 	char *mnt;
-	int ret = 0;
+	int ret = 0, fl;
 
 	if (!v)
 		return 0;
 	if (v->vol) {
-		wcache_flush(v);
+		/* one normal flush; if it still fails, take the abandon path
+		 * so that w_ni / w_na are NULL before ntfs_umount() and no
+		 * memory is leaked */
+		fl = wcache_flush(v);
+		if (fl)
+			wcache_abandon(v);
+		if (v->fatal_err) {
+			/* The volume is not trustworthy any more;
+			 * leave it dirty so Windows runs chkdsk on it. Best
+			 * effort - a failure here only goes to the log. */
+			if (ntfs_volume_write_flags(v->vol,
+					v->vol->flags | VOLUME_IS_DIRTY))
+				ntfs_log_error("could not mark the volume "
+					"dirty: run chkdsk on Windows "
+					"before using it\n");
+		}
+		/* return value priority: the stored error first, then
+		 * this flush's or the abandon path's error, then the error
+		 * of ntfs_umount() itself. Unmount is terminal, the ledger
+		 * dies with the volume. */
+		if (v->pending_err)
+			ret = -v->pending_err;
+		else if (fl)
+			ret = fl;
 		dev = v->vol->dev;
+		priv = dev ? dev->d_private : NULL;
 		mnt = (char *)v->vol->abs_mnt_point;
 		v->vol->abs_mnt_point = NULL;
 		/* ntfs_umount() syncs, closes and frees the device */
-		{
-			void *priv = dev ? dev->d_private : NULL;
-
-			if (ntfs_umount(v->vol, FALSE))
-				ret = neg_errno();
-			free(priv);
-		}
+		if (ntfs_umount(v->vol, FALSE) && !ret)
+			ret = neg_errno();
+		free(priv);
 		free(mnt);
 	}
 	free(v);
@@ -1191,14 +1387,18 @@ int ntfsb_unmount(ntfsb_volume *v)
 
 int ntfsb_sync(ntfsb_volume *v)
 {
-	int ret;
+	int pre, cur;
 
 	if (NVolReadOnly(v->vol))
 		return 0;
-	ret = wcache_flush(v);
-	if (ntfs_device_sync(v->vol->dev) && !ret)
-		ret = neg_errno();
-	return ret;
+	pre = v->pending_err;
+	cur = wcache_flush(v);
+	if (ntfs_device_sync(v->vol->dev) && !cur)
+		cur = neg_errno();
+	/* reporting boundary: a stored error outranks this
+	 * attempt's own result; whatever is not reported stays in the
+	 * ledger */
+	return ledger_report(v, pre, cur);
 }
 
 int ntfsb_get_info(ntfsb_volume *v, ntfsb_info *info)
@@ -1229,7 +1429,11 @@ int ntfsb_set_label(ntfsb_volume *v, const char *label)
 	ntfschar *u = NULL;
 	int len, ret = 0;
 
-	wcache_flush(v);
+	/* a failed flush of the cached file stops this modifying
+	 * operation before it touches anything */
+	ret = wcache_flush(v);
+	if (ret)
+		return ret;
 
 	if (NVolReadOnly(v->vol))
 		return -EROFS;
@@ -1432,7 +1636,11 @@ static int do_create(ntfsb_volume *v, uint64_t dir_ino, const char *name,
 	ntfschar *uname = NULL, *utarget = NULL;
 	int ulen, tlen, ret = 0;
 
-	wcache_flush(v);
+	/* a failed flush of the cached file stops this modifying
+	 * operation before it touches anything */
+	ret = wcache_flush(v);
+	if (ret)
+		return ret;
 
 	if (NVolReadOnly(v->vol))
 		return -EROFS;
@@ -1717,7 +1925,11 @@ int ntfsb_link(ntfsb_volume *v, uint64_t ino, uint64_t dir_ino,
 	ntfschar *uname = NULL;
 	int ulen, ret;
 
-	wcache_flush(v);
+	/* a failed flush of the cached file stops this modifying
+	 * operation before it touches anything */
+	ret = wcache_flush(v);
+	if (ret)
+		return ret;
 
 	if (NVolReadOnly(v->vol))
 		return -EROFS;
@@ -1735,7 +1947,11 @@ int ntfsb_remove(ntfsb_volume *v, uint64_t dir_ino, const char *name)
 	int ulen = 0, ret;
 	u64 ino = 0;
 
-	wcache_flush(v);
+	/* a failed flush of the cached file stops this modifying
+	 * operation before it touches anything */
+	ret = wcache_flush(v);
+	if (ret)
+		return ret;
 
 	if (NVolReadOnly(v->vol))
 		return -EROFS;
@@ -1764,7 +1980,11 @@ int ntfsb_rename(ntfsb_volume *v, uint64_t src_dir, const char *src_name,
 	u64 ino = 0, xino = 0;
 	int have_dst;
 
-	wcache_flush(v);
+	/* a failed flush of the cached file stops this modifying
+	 * operation before it touches anything */
+	ret = wcache_flush(v);
+	if (ret)
+		return ret;
 
 	if (NVolReadOnly(v->vol))
 		return -EROFS;
@@ -1980,6 +2200,8 @@ int64_t ntfsb_write(ntfsb_volume *v, uint64_t ino, const void *buf,
 	s64 total = 0;
 	int64_t ret;
 
+	if (v->fatal_err)
+		return -v->fatal_err;
 	if (NVolReadOnly(v->vol))
 		return -EROFS;
 	if (offset < 0)
@@ -2069,7 +2291,11 @@ int ntfsb_truncate(ntfsb_volume *v, uint64_t ino, uint64_t size)
 	s64 oldsize;
 	int ret = 0;
 
-	wcache_flush(v);
+	/* a failed flush of the cached file stops this modifying
+	 * operation before it touches anything */
+	ret = wcache_flush(v);
+	if (ret)
+		return ret;
 
 	if (NVolReadOnly(v->vol))
 		return -EROFS;
@@ -2121,24 +2347,46 @@ int ntfsb_release(ntfsb_volume *v, uint64_t ino)
 	ntfs_attr *na;
 	int ret = 0;
 
-	wcache_flush(v);
+	/* a failed flush of the cached file stops this modifying
+	 * operation before it touches anything */
+	ret = wcache_flush(v);
+	if (ret)
+		return ret;
 
 	if (NVolReadOnly(v->vol))
 		return 0;
+	errno = 0;
 	ni = ntfs_inode_open(v->vol, ino);
-	if (!ni)
-		return neg_errno();
+	if (!ni) {
+		/* the open failure (e.g. the record cannot be read) is
+		 * part of the release and belongs in the ledger, so the
+		 * next boundary reports it */
+		ret = neg_errno();
+		ledger_record(v, ret);
+		return ret;
+	}
 	if (!ni_is_dir(ni) && (ni->flags & FILE_ATTR_COMPRESSED)
 	    && !(ni->flags & FILE_ATTR_REPARSE_POINT)) {
 		na = ntfs_attr_open(ni, AT_DATA, AT_UNNAMED, 0);
-		if (na) {
-			if (ntfs_attr_pclose(na))
+		if (!na) {
+			/* a compressed file whose data attribute cannot be
+			 * opened is not released either */
+			ret = neg_errno();
+			ledger_record(v, ret);
+		} else {
+			if (ntfs_attr_pclose(na)) {
 				ret = neg_errno();
+				/* the C ledger is the single bookkeeping
+				 * source for flush/release errors */
+				ledger_record(v, ret);
+			}
 			ntfs_attr_close(na);
 		}
 	}
-	if (ntfs_inode_close(ni) && !ret)
+	if (ntfs_inode_close(ni) && !ret) {
 		ret = neg_errno();
+		ledger_record(v, ret);
+	}
 	return ret;
 }
 
@@ -2149,7 +2397,11 @@ int ntfsb_set_times(ntfsb_volume *v, uint64_t ino,
 	ntfs_inode *ni;
 	int ret = 0;
 
-	wcache_flush(v);
+	/* a failed flush of the cached file stops this modifying
+	 * operation before it touches anything */
+	ret = wcache_flush(v);
+	if (ret)
+		return ret;
 
 	(void)ts_zero;
 	if (NVolReadOnly(v->vol))
@@ -2180,7 +2432,11 @@ int ntfsb_set_bsd_flags(ntfsb_volume *v, uint64_t ino, uint32_t flags)
 	le32 old;
 	int ret = 0;
 
-	wcache_flush(v);
+	/* a failed flush of the cached file stops this modifying
+	 * operation before it touches anything */
+	ret = wcache_flush(v);
+	if (ret)
+		return ret;
 
 	if (NVolReadOnly(v->vol))
 		return -EROFS;
@@ -2358,7 +2614,11 @@ int ntfsb_setxattr(ntfsb_volume *v, uint64_t ino, const char *name,
 	int ulen, ret = 0;
 	s64 total = 0;
 
-	wcache_flush(v);
+	/* a failed flush of the cached file stops this modifying
+	 * operation before it touches anything */
+	ret = wcache_flush(v);
+	if (ret)
+		return ret;
 
 	if (NVolReadOnly(v->vol))
 		return -EROFS;
@@ -2428,7 +2688,11 @@ int ntfsb_removexattr(ntfsb_volume *v, uint64_t ino, const char *name)
 	ntfschar *uname = NULL;
 	int ulen, ret = 0;
 
-	wcache_flush(v);
+	/* a failed flush of the cached file stops this modifying
+	 * operation before it touches anything */
+	ret = wcache_flush(v);
+	if (ret)
+		return ret;
 
 	if (NVolReadOnly(v->vol))
 		return -EROFS;

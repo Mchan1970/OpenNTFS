@@ -36,6 +36,14 @@ maint-repair-test: $(BUILD)/ntfstool $(BUILD)/device_path_rules_test
 ntfstool-cmd-test: $(BUILD)/ntfstool
 	NTFSTOOL="$(abspath $(BUILD)/ntfstool)" bash Tools/ntfstool-cmd-selftest.sh
 
+# C-layer flush-error regression; the ASan
+# binary is built by the rules further down, and the T2 leak check runs the
+# UNINSTRUMENTED build/ntfstool under `leaks --atExit` (ASan and leaks do
+# not mix). Disposable image under build/.
+flush-error-test: $(BUILD)/ntfstool_asan $(BUILD)/ntfstool
+	NTFSTOOL_ASAN="$(abspath $(BUILD)/ntfstool_asan)" NTFSTOOL="$(abspath $(BUILD)/ntfstool)" \
+	  bash Tools/flush-error-selftest.sh
+
 # Offline self-test for Tools/install.sh: recording stubs for xcodegen,
 # xcodebuild, pkill, open and lsregister and a temporary install directory;
 # never runs a product build and never touches /Applications.
@@ -94,8 +102,53 @@ $(BUILD)/maint/%.o: $(NTFS3G)/ntfsprogs/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(PROGINC) $(MAINTDEFS) -c $< -o $@
 
+# ntfstool also includes the vendored libntfs-3g consumer headers for the
+# flushtest read-only helper mount (runlist / index / volume flag reads).
+NTFSTOOL_FLAGS := -Wall -ICore -I$(NTFS3G)/include/ntfs-3g \
+	-Wno-deprecated-declarations -Wno-address-of-packed-member
+
 $(BUILD)/ntfstool: Tools/ntfstool.c $(BUILD)/ntfs_bridge.o $(MAINTOBJ) $(BUILD)/libntfs-3g.a
-	$(CC) -O2 -g -Wall -ICore $^ -o $@
+	$(CC) -O2 -g $(NTFSTOOL_FLAGS) $^ -o $@
+
+# ASan build for flush-error-test: the read/write fault injection and
+# the flush-error cases of Tools/ntfstool.c. ASan guards the cases
+# against use-after-free; LeakSanitizer is unavailable on macOS, so the
+# leak checks run the uninstrumented build/ntfstool under `leaks
+# --atExit` instead (see Tools/flush-error-selftest.sh). Separate object
+# tree and binary, so `make` keeps producing the uninstrumented
+# build/ntfstool.
+ASAN_OBJ  := $(BUILD)/asan
+ASAN_CFLAGS := $(CFLAGS) -O1 -fsanitize=address -fno-omit-frame-pointer
+LIBOBJ_ASAN := $(patsubst $(NTFS3G)/libntfs-3g/%.c,$(ASAN_OBJ)/lib/%.o,$(LIBSRC))
+# recursive: MAINTOBJ is defined further down the Makefile
+MAINTOBJ_ASAN = $(patsubst $(BUILD)/maint/%.o,$(ASAN_OBJ)/maint/%.o,$(MAINTOBJ))
+
+$(ASAN_OBJ)/lib/%.o: $(NTFS3G)/libntfs-3g/%.c Core/config.h
+	@mkdir -p $(dir $@)
+	$(CC) $(ASAN_CFLAGS) -c $< -o $@
+
+$(ASAN_OBJ)/libntfs-3g.a: $(LIBOBJ_ASAN)
+	libtool -static -o $@ $^
+
+$(ASAN_OBJ)/ntfs_bridge.o: Core/ntfs_bridge.c Core/ntfs_bridge.h Core/config.h
+	@mkdir -p $(dir $@)
+	$(CC) $(ASAN_CFLAGS) -Wall -Wextra -c $< -o $@
+
+$(ASAN_OBJ)/maint/mkntfs.o: $(NTFS3G)/ntfsprogs/mkntfs.c
+	@mkdir -p $(dir $@)
+	$(CC) $(ASAN_CFLAGS) $(PROGINC) $(MAINTDEFS) -Dmain=mkntfs_main -c $< -o $@
+$(ASAN_OBJ)/maint/ntfsfix.o: $(NTFS3G)/ntfsprogs/ntfsfix.c
+	@mkdir -p $(dir $@)
+	$(CC) $(ASAN_CFLAGS) $(PROGINC) $(MAINTDEFS) -Dmain=ntfsfix_main -c $< -o $@
+$(ASAN_OBJ)/maint/ntfs_maint.o: Core/ntfs_maint.c Core/ntfs_maint.h
+	@mkdir -p $(dir $@)
+	$(CC) $(ASAN_CFLAGS) -Wall -Wextra -c $< -o $@
+$(ASAN_OBJ)/maint/%.o: $(NTFS3G)/ntfsprogs/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(ASAN_CFLAGS) $(PROGINC) $(MAINTDEFS) -c $< -o $@
+
+$(BUILD)/ntfstool_asan: Tools/ntfstool.c $(ASAN_OBJ)/ntfs_bridge.o $(MAINTOBJ_ASAN) $(ASAN_OBJ)/libntfs-3g.a
+	$(CC) -O1 -g -fsanitize=address $(NTFSTOOL_FLAGS) $^ -o $@
 
 $(BUILD)/mkntfs: $(NTFS3G)/ntfsprogs/mkntfs.c $(PROGSRC) $(BUILD)/libntfs-3g.a
 	$(CC) $(CFLAGS) $(PROGINC) $^ -o $@
@@ -105,6 +158,17 @@ $(BUILD)/ntfsfix: $(NTFS3G)/ntfsprogs/ntfsfix.c $(NTFS3G)/ntfsprogs/utils.c $(BU
 
 clean:
 	rm -rf $(BUILD)
+
+# Offline tests for the pure Swift error-handoff logic:
+# the error ledger, the pending-release scheduling, the fail-stop
+# pre-release and the maintenance gate, every bridge call injected as a
+# closure; no FSKit, no extension installed.
+extension-error-test: $(BUILD)/extension_error_test
+	$(BUILD)/extension_error_test
+
+$(BUILD)/extension_error_test: Extension/VolumeErrorState.swift Tools/extension_error_test_main.swift
+	@mkdir -p $(BUILD)
+	xcrun swiftc -parse-as-library $^ -o $@
 
 # Offline orchestration tests for the App maintenance flow (check/repair +
 # post-maintenance remount + result composition). Compiles the REAL App
@@ -131,7 +195,7 @@ $(BUILD)/app_orchestration_test: App/Mounter.swift App/DiskMonitor.swift App/Hel
 app-orchestration-stub-selfcheck: $(BUILD)/app_orchestration_test
 	$(BUILD)/app_orchestration_test --stub-selfcheck
 
-.PHONY: all clean maint-repair-test ntfstool-cmd-test install-script-test lease-store-test lease-store-scene-selfcheck app-orchestration-test app-orchestration-stub-selfcheck da-qual-offline
+.PHONY: all clean maint-repair-test ntfstool-cmd-test flush-error-test extension-error-test install-script-test lease-store-test lease-store-scene-selfcheck app-orchestration-test app-orchestration-stub-selfcheck da-qual-offline
 
 # Optional local targets. Tools/private.mk is not part of the source
 # distribution; `-include` makes its absence a no-op.

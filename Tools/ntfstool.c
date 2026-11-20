@@ -21,6 +21,16 @@
  *   ntfstool <image> rmxattr <path> <name>
  *   ntfstool <image> label <new label>
  *   ntfstool <image> stress <seed> <iterations>
+ *   ntfstool <image> mftoff <path>            (byte range of the file's MFT record,
+ *                                              read from the boot sector)
+ *   ntfstool <image> flushtest <t1..t9>
+ *        Write-flush fault-injection regression. Injection is
+ *        enabled only by this command, after the
+ *        file data has been written; NTFSTOOL_FAIL_ERRNO and
+ *        NTFSTOOL_FAIL_MODE override the fault parameters (t5 pins its
+ *        errnos because it exercises the priority between two of them).
+ *        t6 and t8 need a 256 MiB image (preallocation requires the
+ *        free space).
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -36,13 +46,190 @@
 
 #include "ntfs_bridge.h"
 #include "ntfs_maint.h"
+/* libntfs-3g consumer API, used by flushtest only: an independent
+ * read-only helper mount that inspects committed metadata (runlists,
+ * directory index entries, volume flags). No vendored code is modified. */
+#include "attrib.h"
+#include "dir.h"
+#include "index.h"
+#include "inode.h"
+#include "layout.h"
+#include "runlist.h"
+#include "unistr.h"
+#include "volume.h"
 
 static int g_fd = -1;
+static const char *g_image;
 static unsigned long g_nw, g_nw_small, g_nr;
+
+/* ---------------------------------------------------- fault injection
+ *
+ * Fault injection for the flush-error regression tests: one injector
+ * for device writes (with a second slot for a disjoint write range)
+ * and one for device reads. Each is dormant unless the flushtest
+ * command arms it; every other command keeps bit-for-bit default
+ * behaviour.
+ *
+ * While armed, each io_pwrite()/io_pread() whose byte range intersects
+ * the armed [start, end) counts as an attempt against the target
+ * range; while failing is set the transfer is rejected wholesale with
+ * err (nothing reaches the image or the tool). mode "once" stops
+ * failing after the first hit but keeps counting attempts, so a test
+ * can tell how many times a single boundary retries. Counters
+ * accumulate for the lifetime of the process.
+ */
+struct ft_fault {
+	int monitored, failing;
+	int64_t start, end;
+	int err, once;
+	unsigned long attempts, failures;
+};
+static struct ft_fault g_fault;     /* writes, primary range */
+static struct ft_fault g_fault2;    /* writes, second range (t7b) */
+static struct ft_fault g_fault_rd;  /* read faults (t9) */
+
+static int fault_errno_name(const char *s, int fallback)
+{
+	if (!s || !*s)
+		return fallback;
+	if (!strcmp(s, "EIO"))
+		return EIO;
+	if (!strcmp(s, "ENOSPC"))
+		return ENOSPC;
+	if (!strcmp(s, "EROFS"))
+		return EROFS;
+	return atoi(s) > 0 ? atoi(s) : fallback;
+}
+
+static int fault_mode_name(const char *s, int once)
+{
+	if (!s || !*s)
+		return once;
+	if (!strcmp(s, "once"))
+		return 1;
+	if (!strcmp(s, "always"))
+		return 0;
+	fprintf(stderr, "ntfstool: unknown NTFSTOOL_FAIL_MODE %s\n", s);
+	return once;
+}
+
+static void fault_arm_at(struct ft_fault *f, int64_t start, int64_t end,
+		int err, int once)
+{
+	f->monitored = 1;
+	f->failing = 1;
+	f->start = start;
+	f->end = end;
+	f->err = err;
+	f->once = once;
+}
+
+static void fault_arm(int64_t start, int64_t end, int err, int once)
+{
+	fault_arm_at(&g_fault, start, end, err, once);
+}
+
+static void fault_disarm(void)
+{
+	g_fault.monitored = 0;
+	g_fault.failing = 0;
+	g_fault2.monitored = 0;
+	g_fault2.failing = 0;
+	g_fault_rd.monitored = 0;
+	g_fault_rd.failing = 0;
+}
+
+/* Called from io_pwrite() for a write that intersects the range.
+ * Returns the errno to fail the write with, or 0 to let it through. */
+static int fault_hit(struct ft_fault *f)
+{
+	f->attempts++;
+	if (!f->failing)
+		return 0;
+	f->failures++;
+	if (f->once)
+		f->failing = 0;
+	return f->err;
+}
+
+/* -------------------------------------------------- NTFS boot sector
+ *
+ * Read the layout parameters straight from the boot sector, so tools can
+ * compute MFT record offsets without touching the bridge internals. The
+ * MFT of a freshly formatted image is one contiguous run starting at
+ * mft_lcn (mkntfs does not fragment it that early), which is what the
+ * flush-error tests rely on.
+ */
+static uint16_t rd_le16(const unsigned char *p)
+{
+	return (uint16_t)(p[0] | (p[1] << 8));
+}
+
+static int64_t rd_le64(const unsigned char *p)
+{
+	uint64_t v = 0;
+	int i;
+
+	for (i = 7; i >= 0; i--)
+		v = (v << 8) | p[i];
+	return (int64_t)v;
+}
+
+static int boot_geometry(uint32_t *sector, uint32_t *cluster, uint32_t *mrs,
+		int64_t *mft_off)
+{
+	unsigned char b[512];
+	uint32_t ss, cs, m;
+	uint8_t spc;
+	int8_t cm;
+	int64_t lcn;
+
+	if (pread(g_fd, b, sizeof(b), 0) != (ssize_t)sizeof(b))
+		return -1;
+	if (memcmp(b + 3, "NTFS    ", 8))
+		return -1;
+	ss = rd_le16(b + 11);
+	if (ss < 512 || ss > 4096 || (ss & (ss - 1)))
+		return -1;
+	spc = b[13];
+	cs = spc > 0x80 ? ss << (256 - spc) : ss * spc;
+	if (!cs || (cs & (cs - 1)))
+		return -1;
+	cm = (int8_t)b[64];
+	m = cm > 0 ? cs * (uint32_t)cm : (cm < 0 && cm > -16) ? 1U << -cm : 0;
+	/* a record must fit one cluster and one sector, so a record write
+	 * reaches the device as a single aligned pwrite */
+	if (m < ss || m > cs || m > 65536 || (m & (m - 1)))
+		return -1;
+	lcn = rd_le64(b + 48);
+	if (lcn <= 0)
+		return -1;
+	*sector = ss;
+	*cluster = cs;
+	*mrs = m;
+	*mft_off = lcn * cs;
+	return 0;
+}
+
+static void ino_record_range(int64_t mft_off, uint32_t mrs, uint64_t ino,
+		int64_t *start, int64_t *end)
+{
+	*start = mft_off + (int64_t)ino * mrs;
+	*end = *start + mrs;
+}
 
 static int64_t io_pread(void *ctx, void *buf, int64_t count, int64_t off)
 {
-	ssize_t r = pread(g_fd, buf, count, off);
+	ssize_t r;
+
+	if (g_fault_rd.monitored && off < g_fault_rd.end
+	    && off + count > g_fault_rd.start) {
+		int err = fault_hit(&g_fault_rd);
+
+		if (err)
+			return -err;
+	}
+	r = pread(g_fd, buf, count, off);
 	g_nr++;
 	if (getenv("NTFSTOOL_TRACE") && g_nw > 150 && g_nw < 175)
 		fprintf(stderr, "R %10lld +%lld\n", (long long)off, (long long)count);
@@ -55,11 +242,44 @@ static void io_stats(void)
 	if (getenv("NTFSTOOL_STATS"))
 		fprintf(stderr, "device writes: %lu (%lu of <= 64K), reads: %lu\n",
 			g_nw, g_nw_small, g_nr);
+	if (g_fault.monitored || g_fault.attempts || g_fault.failures)
+		fprintf(stderr, "write fault 1: attempts %lu, failures %lu "
+			"(range [%lld,%lld) errno %d mode %s)\n",
+			g_fault.attempts, g_fault.failures,
+			(long long)g_fault.start, (long long)g_fault.end,
+			g_fault.err, g_fault.once ? "once" : "always");
+	if (g_fault2.monitored || g_fault2.attempts || g_fault2.failures)
+		fprintf(stderr, "write fault 2: attempts %lu, failures %lu "
+			"(range [%lld,%lld) errno %d mode %s)\n",
+			g_fault2.attempts, g_fault2.failures,
+			(long long)g_fault2.start, (long long)g_fault2.end,
+			g_fault2.err, g_fault2.once ? "once" : "always");
+	if (g_fault_rd.monitored || g_fault_rd.attempts || g_fault_rd.failures)
+		fprintf(stderr, "read fault: attempts %lu, failures %lu "
+			"(range [%lld,%lld) errno %d mode %s)\n",
+			g_fault_rd.attempts, g_fault_rd.failures,
+			(long long)g_fault_rd.start, (long long)g_fault_rd.end,
+			g_fault_rd.err, g_fault_rd.once ? "once" : "always");
 }
 
 static int64_t io_pwrite(void *ctx, const void *buf, int64_t count, int64_t off)
 {
-	ssize_t r = pwrite(g_fd, buf, count, off);
+	ssize_t r;
+
+	if (g_fault.monitored && off < g_fault.end && off + count > g_fault.start) {
+		int err = fault_hit(&g_fault);
+
+		if (err)
+			return -err;
+	}
+	if (g_fault2.monitored && off < g_fault2.end
+	    && off + count > g_fault2.start) {
+		int err = fault_hit(&g_fault2);
+
+		if (err)
+			return -err;
+	}
+	r = pwrite(g_fd, buf, count, off);
 	g_nw++;
 	if (getenv("NTFSTOOL_TRACE") && g_nw > 150 && g_nw < 175)
 		fprintf(stderr, "W %10lld +%lld\n", (long long)off, (long long)count);
@@ -370,6 +590,1103 @@ static ntfsb_volume *do_mount(const ntfsb_device *dev, unsigned flags)
 	return v;
 }
 
+/* -------------------------------------------------- flush error tests
+ *
+ * The flush-error regression cases. Every case runs in ONE process
+ * on its own freshly formatted image: the write cache that keeps the file
+ * being written open belongs to the process, so write -> inject -> sync
+ * -> verify cannot be split across invocations.
+ *
+ * The assertions state the intended behaviour: sticky flush errors,
+ * a single owned flush, and call points that stop on the first failure.
+ * Every case prints each failed assertion and exits non-zero.
+ */
+
+#define FT_T0 1700000000         /* baseline mtime for file B */
+#define FT_T1 (FT_T0 + 3600)     /* mtime the failing set_times tries to set */
+
+static int ft_checks, ft_fails;
+
+static void ft_assert(const char *id, const char *what, int ok,
+		const char *detail)
+{
+	char tail[96];
+
+	ft_checks++;
+	if (!ok)
+		ft_fails++;
+	if (detail && *detail)
+		snprintf(tail, sizeof(tail), " (%s)", detail);
+	else
+		tail[0] = 0;
+	printf("%s: [%s] %s%s\n", ok ? "ok" : "FAIL", id, what, tail);
+}
+
+static const char *ft_rc(int r)
+{
+	static char buf[8][48];
+	static int n;
+
+	n = (n + 1) & 7;
+	if (r)
+		snprintf(buf[n], sizeof(buf[n]), "got %d (%s)", r, strerror(-r));
+	else
+		snprintf(buf[n], sizeof(buf[n]), "got 0");
+	return buf[n];
+}
+
+static const char *ft_growth(unsigned long da, unsigned long df)
+{
+	static char buf[8][64];
+	static int n;
+
+	n = (n + 1) & 7;
+	snprintf(buf[n], sizeof(buf[n]), "attempts +%lu, failures +%lu",
+		da, df);
+	return buf[n];
+}
+
+static const char *ft_ll(const char *what, long long v)
+{
+	static char buf[8][64];
+	static int n;
+
+	n = (n + 1) & 7;
+	snprintf(buf[n], sizeof(buf[n]), "%s %lld", what, v);
+	return buf[n];
+}
+
+static int ft_done(const char *id)
+{
+	printf("[%s] %d/%d assertions passed\n", id, ft_checks - ft_fails,
+		ft_checks);
+	return ft_fails ? 1 : 0;
+}
+
+static void ft_pattern(unsigned char *p, size_t n, uint32_t seed)
+{
+	uint32_t x = seed;
+	size_t i;
+
+	for (i = 0; i < n; i++) {
+		x = x * 1664525u + 1013904223u;
+		p[i] = (unsigned char)(x >> 24);
+	}
+}
+
+/* Create <name> with n bytes of a deterministic pattern in @dir
+ * (n <= 512, so the data stays resident in the MFT record). The last
+ * file created stays in the write cache: it is the file whose flush the
+ * case breaks. */
+static int ft_make_file_at(ntfsb_volume *v, uint64_t dir, const char *name,
+		size_t n, uint32_t seed, uint64_t *ino)
+{
+	unsigned char buf[512];
+	ntfsb_stat st;
+	int r;
+
+	if (n > sizeof(buf))
+		return -EINVAL;
+	ft_pattern(buf, n, seed);
+	r = ntfsb_create(v, dir, name, S_IFREG, &st);
+	if (r)
+		return r;
+	*ino = st.ino;
+	if (n && ntfsb_write(v, st.ino, buf, n, 0) != (int64_t)n)
+		return -EIO;
+	return 0;
+}
+
+static int ft_make_file(ntfsb_volume *v, const char *name, size_t n,
+		uint32_t seed, uint64_t *ino)
+{
+	return ft_make_file_at(v, NTFSB_ROOT_INO, name, n, seed, ino);
+}
+
+/* ------------------------------------------------ read-only helper mount
+ *
+ * A second, independent read-only mount through libntfs-3g's own unix_io
+ * driver (its own file descriptor). The flush-error cases use it to
+ * inspect COMMITTED on-disk metadata while the bridge volume is open or
+ * after it unmounted: runlists, directory index entries and the volume
+ * flags. It never writes.
+ */
+static ntfs_volume *helper_mount(void)
+{
+	errno = 0;
+	ntfs_volume *h = ntfs_mount(g_image, NTFS_MNT_RDONLY);
+
+	if (!h)
+		fprintf(stderr, "flushtest: helper mount of %s failed: %s\n",
+			g_image, strerror(errno));
+	return h;
+}
+
+static void helper_umount(ntfs_volume *h)
+{
+	if (h)
+		ntfs_umount(h, FALSE);
+}
+
+/*
+ * The byte range covering the mapped part of @na's runlist. Fails when
+ * it is fragmented, so the fault injection can cover it with a single
+ * [start, end) range. Freshly formatted images allocate these
+ * attributes in one piece.
+ */
+static int attr_data_range(ntfs_attr *na, int64_t *start, int64_t *end)
+{
+	runlist_element *rl;
+	s64 cs = na->ni->vol->cluster_size;
+	s64 s = -1, e = -1;
+
+	/* the runlist is loaded lazily */
+	if (ntfs_attr_map_whole_runlist(na))
+		return -1;
+	for (rl = na->rl; rl && rl->length; rl++) {
+		s64 rs = rl->lcn * cs;
+
+		if (rl->lcn < 0)
+			continue;
+		if (s < 0) {
+			s = rs;
+			e = rs + rl->length * cs;
+		} else if (rs != e) {
+			return -1;
+		} else {
+			e += rl->length * cs;
+		}
+	}
+	if (s < 0)
+		return -1;
+	*start = s;
+	*end = e;
+	return 0;
+}
+
+static ntfsb_volume *ft_remount(ntfsb_device *dev)
+{
+	int err = 0;
+
+	return ntfsb_mount(dev, 0, getuid(), getgid(), &err);
+}
+
+/* Resolve /<path>, assert its size and read the content back. */
+static void ft_verify(ntfsb_volume *v, const char *id, const char *path,
+		size_t n, uint32_t seed)
+{
+	unsigned char want[512], got[512];
+	ntfsb_stat st;
+	uint64_t ino;
+	char d[64];
+	int r, ok = 1;
+
+	ft_pattern(want, n, seed);
+	r = resolve(v, path, &ino, &st);
+	if (r) {
+		ft_assert(id, "file resolves", 0, ft_rc(r));
+		return;
+	}
+	snprintf(d, sizeof(d), "got %llu", (unsigned long long)st.size);
+	ft_assert(id, "file size survived", st.size == n, d);
+	if (st.size != n || st.size > sizeof(got))
+		return;
+	if (ntfsb_read(v, ino, got, st.size, 0) != (int64_t)st.size
+	    || memcmp(got, want, st.size))
+		ok = 0;
+	ft_assert(id, "file content survived", ok,
+		ok ? "" : "read back mismatch");
+}
+
+static int ft_set_times(ntfsb_volume *v, uint64_t ino, time_t t)
+{
+	struct timespec ts;
+
+	ts.tv_sec = t;
+	ts.tv_nsec = 0;
+	return ntfsb_set_times(v, ino, &ts, &ts, &ts, &ts);
+}
+
+/* Resolve /<path> and assert that it does NOT exist. */
+static void ft_assert_absent(ntfsb_volume *v, const char *id, const char *path)
+{
+	ntfsb_stat st;
+	uint64_t ino;
+	char what[80];
+	int r = resolve(v, path, &ino, &st);
+
+	snprintf(what, sizeof(what), "%s does not exist", path);
+	ft_assert(id, what, r == -ENOENT, ft_rc(r));
+}
+
+
+/* Compute and report the MFT record range of @ino, arming target. */
+static int ft_target(const char *id, uint64_t ino, int64_t *start,
+		int64_t *end)
+{
+	uint32_t sector, cluster, mrs;
+	int64_t mft_off;
+
+	if (boot_geometry(&sector, &cluster, &mrs, &mft_off)) {
+		fprintf(stderr, "flushtest: cannot parse the boot sector\n");
+		return -1;
+	}
+	ino_record_range(mft_off, mrs, ino, start, end);
+	printf("[%s] geometry: sector %u cluster %u mft_record %u; target "
+		"ino %llu mft_record %lld..%lld\n", id, sector, cluster, mrs,
+		(unsigned long long)ino, (long long)*start, (long long)*end);
+	return 0;
+}
+
+/* Arm the injection. @pinned (t5) keeps the requested errno/mode: the
+ * case is exactly about the priority between two different errnos. */
+static void ft_arm(const char *id, int64_t start, int64_t end, int err,
+		int once, int pinned)
+{
+	int e = err, o = once;
+
+	if (!pinned) {
+		e = fault_errno_name(getenv("NTFSTOOL_FAIL_ERRNO"), err);
+		o = fault_mode_name(getenv("NTFSTOOL_FAIL_MODE"), once);
+	}
+	fault_arm(start, end, e, o);
+	printf("[%s] injection armed: range [%lld,%lld) errno %d mode %s\n",
+		id, (long long)start, (long long)end, e,
+		o ? "once" : "always");
+}
+
+static int ft_setup2(ntfsb_volume *v, uint32_t aseed, uint32_t bseed,
+		uint64_t *aino, uint64_t *bino)
+{
+	/* B first with a stable baseline time: writing A afterwards leaves
+	 * A, and only A, dirty in the write cache. */
+	if (ft_make_file(v, "b.bin", 100, bseed, bino)
+	    || ft_set_times(v, *bino, FT_T0)
+	    || ft_make_file(v, "a.bin", 256, aseed, aino)) {
+		fprintf(stderr, "flushtest: setup failed\n");
+		return -1;
+	}
+	return 0;
+}
+
+/* T1: a one-shot EIO on A's MFT record. */
+static int ft_t1(ntfsb_device *dev, ntfsb_volume *v)
+{
+	const char *id = "t1";
+	int64_t rs, re;
+	uint64_t ino;
+	int r, r1, r2, ur;
+	unsigned long att1, fails;
+
+	r = ft_make_file(v, "a.bin", 256, 0x010101, &ino);
+	if (r || ft_target(id, ino, &rs, &re))
+		return 1;
+	ft_arm(id, rs, re, EIO, 1, 0);
+	r1 = ntfsb_sync(v);
+	att1 = g_fault.attempts;
+	fails = g_fault.failures;
+	r2 = ntfsb_sync(v);
+	ur = ntfsb_unmount(v);
+	ft_assert(id, "first ntfsb_sync returns -EIO", r1 == -EIO, ft_rc(r1));
+	ft_assert(id, "exactly one write attempt against the target range "
+		"during the first sync", att1 == 1,
+		ft_ll("attempts", (long long)att1));
+	ft_assert(id, "the target range saw at least one failed write",
+		fails > 0, ft_ll("failures", (long long)fails));
+	ft_assert(id, "second ntfsb_sync returns 0", r2 == 0, ft_rc(r2));
+	ft_assert(id, "unmount after the successful retry returns 0",
+		ur == 0, ft_rc(ur));
+	fault_disarm();
+	v = ft_remount(dev);
+	ft_assert(id, "image remounts", v != NULL, v ? "" : "mount failed");
+	if (v) {
+		ft_verify(v, id, "/a.bin", 256, 0x010101);
+		ur = ntfsb_unmount(v);
+		ft_assert(id, "final unmount returns 0", ur == 0, ft_rc(ur));
+	}
+	return ft_done(id);
+}
+
+/* T2: persistent failure, every sync and the unmount must report it. */
+static int ft_t2(ntfsb_device *dev, ntfsb_volume *v)
+{
+	const char *id = "t2";
+	int64_t rs, re;
+	uint64_t ino, keep;
+	ntfsb_stat st;
+	char d[64];
+	int r, r1, r2, ur;
+
+	if (ft_make_file(v, "keep.bin", 512, 0x020202, &keep)
+	    || ft_make_file(v, "a.bin", 256, 0x030303, &ino)
+	    || ft_target(id, ino, &rs, &re))
+		return 1;
+	unsigned long a0, a1, a2, f0, f1, f2;
+
+	ft_arm(id, rs, re, EIO, 0, 0);
+	a0 = g_fault.attempts; f0 = g_fault.failures;
+	r1 = ntfsb_sync(v);
+	a1 = g_fault.attempts; f1 = g_fault.failures;
+	r2 = ntfsb_sync(v);
+	a2 = g_fault.attempts; f2 = g_fault.failures;
+	ur = ntfsb_unmount(v);
+	ft_assert(id, "first ntfsb_sync returns -EIO", r1 == -EIO, ft_rc(r1));
+	ft_assert(id, "the first sync retried the target range",
+		a1 > a0 && f1 > f0, ft_growth(a1 - a0, f1 - f0));
+	ft_assert(id, "second ntfsb_sync still returns -EIO", r2 == -EIO,
+		ft_rc(r2));
+	ft_assert(id, "the second sync retried the target range again",
+		a2 > a1 && f2 > f1, ft_growth(a2 - a1, f2 - f1));
+	ft_assert(id, "unmount returns -EIO", ur == -EIO, ft_rc(ur));
+	/* The ASan build guards the "no use-after-free" part of this case.
+	 * (LeakSanitizer is not available on macOS, so the leaked inode of
+	 * the unfixed code shows up through the swallowed errors above
+	 * instead of a leak report.) */
+	fault_disarm();
+	v = ft_remount(dev);
+	ft_assert(id, "image remounts once injection is disabled", v != NULL,
+		v ? "" : "mount failed");
+	if (v) {
+		ft_verify(v, id, "/keep.bin", 512, 0x020202);
+		r = resolve(v, "/a.bin", &ino, &st);
+		if (r) {
+			ft_assert(id, "a.bin resolves after remount", 0,
+				ft_rc(r));
+		} else {
+			snprintf(d, sizeof(d), "got %llu",
+				(unsigned long long)st.size);
+			ft_assert(id, "a.bin size is the pre-write or "
+				"post-write size",
+				st.size == 0 || st.size == 256, d);
+		}
+		ur = ntfsb_unmount(v);
+		ft_assert(id, "final unmount returns 0", ur == 0, ft_rc(ur));
+	}
+	return ft_done(id);
+}
+
+/* T3: a failure while flushing A must surface through an operation on B. */
+static int ft_t3(ntfsb_device *dev, ntfsb_volume *v)
+{
+	const char *id = "t3";
+	int64_t rs, re;
+	uint64_t aino, bino;
+	ntfsb_stat st;
+	char d[64];
+	int rb, r, r1, r2, ur;
+
+	(void)dev;
+	if (ft_setup2(v, 0x050505, 0x040404, &aino, &bino)
+	    || ft_target(id, aino, &rs, &re))
+		return 1;
+	ft_arm(id, rs, re, EIO, 1, 0);
+	rb = ft_set_times(v, bino, FT_T1);
+	r = resolve(v, "/b.bin", &bino, &st);
+	r1 = ntfsb_sync(v);
+	r2 = ntfsb_sync(v);
+	ft_assert(id, "set_times on B returns -EIO (A's flush error not "
+		"swallowed)", rb == -EIO, ft_rc(rb));
+	if (r) {
+		ft_assert(id, "B resolves", 0, ft_rc(r));
+	} else {
+		snprintf(d, sizeof(d), "got %lld", (long long)st.mtime.tv_sec);
+		ft_assert(id, "B untouched: mtime unchanged",
+			st.mtime.tv_sec == FT_T0, d);
+		snprintf(d, sizeof(d), "got %llu", (unsigned long long)st.size);
+		ft_assert(id, "B untouched: size unchanged", st.size == 100, d);
+	}
+	ft_assert(id, "first ntfsb_sync still returns A's -EIO", r1 == -EIO,
+		ft_rc(r1));
+	ft_assert(id, "second ntfsb_sync returns 0", r2 == 0, ft_rc(r2));
+	ft_assert(id, "the target range saw at least one failed write",
+		g_fault.failures > 0,
+		ft_ll("failures", (long long)g_fault.failures));
+	ft_verify(v, id, "/a.bin", 256, 0x050505);
+	ur = ntfsb_unmount(v);
+	ft_assert(id, "final unmount returns 0", ur == 0, ft_rc(ur));
+	return ft_done(id);
+}
+
+/* T4: with the flush persistently failing, every modifying call point
+ * must refuse, and B must not be touched. */
+static int ft_t4(ntfsb_device *dev, ntfsb_volume *v)
+{
+	const char *id = "t4";
+	struct { const char *what; int rc; } ops[11];
+	int64_t rs, re;
+	uint64_t aino, bino, ino;
+	ntfsb_stat st0, st;
+	char d[96];
+	int i, r, ur;
+
+	ntfsb_info info;
+	int64_t xa;
+	char xbuf[8];
+
+	(void)dev;
+	/* B with a stable baseline, plus valid targets for every operation,
+	 * all created while nothing is armed: the rename/remove sources and
+	 * the xattr to remove exist, so the only possible failure of the
+	 * operations below is the injected one. */
+	if (ft_make_file(v, "b.bin", 100, 0x060606, &bino)
+	    || ft_set_times(v, bino, FT_T0)) {
+		fprintf(stderr, "flushtest t4: setup failed\n");
+		return 1;
+	}
+	r = ntfsb_link(v, bino, NTFSB_ROOT_INO, "b.link");
+	r |= ntfsb_link(v, bino, NTFSB_ROOT_INO, "b.link2");
+	r |= ntfsb_setxattr(v, bino, "flushtest.xattr", "orig", 4, 0);
+	ft_assert(id, "setup of the valid targets", r == 0, ft_rc(r));
+	r = resolve(v, "/b.bin", &bino, &st0);
+	ft_assert(id, "baseline stat of B", r == 0, ft_rc(r));
+	ntfsb_get_info(v, &info);
+	/* A last: it stays dirty in the write cache */
+	if (ft_make_file(v, "a.bin", 256, 0x070707, &aino)) {
+		fprintf(stderr, "flushtest t4: target setup failed\n");
+		return 1;
+	}
+	if (ft_target(id, aino, &rs, &re))
+		return 1;
+	ft_arm(id, rs, re, EIO, 0, 0);
+	ops[0].what = "ntfsb_create(/c.bin)";
+	ops[0].rc = ntfsb_create(v, NTFSB_ROOT_INO, "c.bin", S_IFREG, &st);
+	ops[1].what = "ntfsb_set_times(B)";
+	ops[1].rc = ft_set_times(v, bino, FT_T1);
+	ops[2].what = "ntfsb_set_bsd_flags(B, hidden)";
+	ops[2].rc = ntfsb_set_bsd_flags(v, bino, UF_HIDDEN);
+	ops[3].what = "ntfsb_setxattr(B, replace)";
+	ops[3].rc = ntfsb_setxattr(v, bino, "flushtest.xattr", "new", 3, 0);
+	ops[4].what = "ntfsb_removexattr(B)";
+	ops[4].rc = ntfsb_removexattr(v, bino, "flushtest.xattr");
+	ops[5].what = "ntfsb_truncate(B, 4096)";
+	ops[5].rc = ntfsb_truncate(v, bino, 4096);
+	ops[6].what = "ntfsb_link(B, /b3.link)";
+	ops[6].rc = ntfsb_link(v, bino, NTFSB_ROOT_INO, "b3.link");
+	ops[7].what = "ntfsb_rename(/b.link, /b.link4)";
+	ops[7].rc = ntfsb_rename(v, NTFSB_ROOT_INO, "b.link",
+		NTFSB_ROOT_INO, "b.link4");
+	ops[8].what = "ntfsb_release(B)";
+	ops[8].rc = ntfsb_release(v, bino);
+	ops[9].what = "ntfsb_remove(/b.link2)";
+	ops[9].rc = ntfsb_remove(v, NTFSB_ROOT_INO, "b.link2");
+	ops[10].what = "ntfsb_set_label";
+	ops[10].rc = ntfsb_set_label(v, "FlushFault");
+	for (i = 0; i < (int)(sizeof(ops) / sizeof(ops[0])); i++) {
+		char what[96];
+
+		/* the injected error exactly: any other errno (ENOENT,
+		 * EEXIST ...) would mean the call ran for the wrong
+		 * reason */
+		snprintf(what, sizeof(what), "%s returns -EIO", ops[i].what);
+		ft_assert(id, what, ops[i].rc == -EIO, ft_rc(ops[i].rc));
+	}
+	fault_disarm();
+	r = resolve(v, "/b.bin", &bino, &st);
+	if (r) {
+		ft_assert(id, "B resolves after the operations", 0, ft_rc(r));
+	} else {
+		snprintf(d, sizeof(d), "got %llu, want %llu",
+			(unsigned long long)st.size,
+			(unsigned long long)st0.size);
+		ft_assert(id, "B untouched: size", st.size == st0.size, d);
+		snprintf(d, sizeof(d), "got %u, want %u", st.nlink, st0.nlink);
+		ft_assert(id, "B untouched: link count", st.nlink == st0.nlink, d);
+		snprintf(d, sizeof(d), "got %lld", (long long)st.mtime.tv_sec);
+		ft_assert(id, "B untouched: mtime",
+			st.mtime.tv_sec == FT_T0, d);
+		snprintf(d, sizeof(d), "got 0x%x, want 0x%x", st.ntfs_attrs,
+			st0.ntfs_attrs);
+		ft_assert(id, "B untouched: attributes",
+			st.ntfs_attrs == st0.ntfs_attrs, d);
+	}
+	ft_assert(id, "the target range saw at least one failed write",
+		g_fault.failures > 0,
+		ft_ll("failures", (long long)g_fault.failures));
+	/* every operation was refused, so nothing they would have created
+	 * may exist either, and what they would have changed is intact */
+	ft_assert_absent(v, id, "/c.bin");
+	ft_assert_absent(v, id, "/b3.link");
+	ft_assert_absent(v, id, "/b.link4");
+	r = resolve(v, "/b.link", &ino, &st);
+	snprintf(d, sizeof(d), "lookup /b.link: %s", ft_rc(r));
+	ft_assert(id, "the rename source still exists", r == 0, d);
+	r = resolve(v, "/b.link2", &ino, &st);
+	snprintf(d, sizeof(d), "lookup /b.link2: %s", ft_rc(r));
+	ft_assert(id, "the remove target still exists", r == 0, d);
+	xa = ntfsb_getxattr(v, bino, "flushtest.xattr", xbuf, sizeof(xbuf) - 1);
+	snprintf(d, sizeof(d), "got %lld bytes", (long long)xa);
+	ft_assert(id, "B keeps its original xattr",
+		xa == 4 && !memcmp(xbuf, "orig", 4), d);
+	ntfsb_get_info(v, &info);
+	snprintf(d, sizeof(d), "got label '%s'", info.label);
+	ft_assert(id, "the volume label is unchanged",
+		!strcmp(info.label, "FlushErr"), d);
+	/* unmount result is not asserted: with the fix it reports the still
+	 * failing flush, the old code drops it. */
+	ur = ntfsb_unmount(v);
+	(void)ur;
+	return ft_done(id);
+}
+
+/* T5: a stored EIO outranks the newer ENOSPC of the same sync. */
+static int ft_t5(ntfsb_device *dev, ntfsb_volume *v)
+{
+	const char *id = "t5";
+	int64_t rs, re;
+	uint64_t aino, bino;
+	int rb, r1, r2, r3, ur;
+
+	(void)dev;
+	if (ft_setup2(v, 0x090909, 0x080808, &aino, &bino)
+	    || ft_target(id, aino, &rs, &re))
+		return 1;
+	/* first failure: EIO while flushing A, recorded by set_times on B */
+	ft_arm(id, rs, re, EIO, 1, 1);
+	rb = ft_set_times(v, bino, FT_T1);
+	/* second failure: ENOSPC when the boundary sync retries the flush */
+	ft_arm(id, rs, re, ENOSPC, 1, 1);
+	r1 = ntfsb_sync(v);
+	r2 = ntfsb_sync(v);
+	r3 = ntfsb_sync(v);
+	ft_assert(id, "set_times on B returns -EIO and files EIO in the "
+		"error ledger", rb == -EIO, ft_rc(rb));
+	ft_assert(id, "first ntfsb_sync reports the stored EIO, not the new "
+		"ENOSPC", r1 == -EIO, ft_rc(r1));
+	ft_assert(id, "second ntfsb_sync reports ENOSPC", r2 == -ENOSPC,
+		ft_rc(r2));
+	ft_assert(id, "third ntfsb_sync returns 0", r3 == 0, ft_rc(r3));
+	ft_assert(id, "the target range saw at least one failed write",
+		g_fault.failures > 0,
+		ft_ll("failures", (long long)g_fault.failures));
+	ft_verify(v, id, "/a.bin", 256, 0x090909);
+	ur = ntfsb_unmount(v);
+	ft_assert(id, "final unmount returns 0", ur == 0, ft_rc(ur));
+	return ft_done(id);
+}
+
+/* T6: the preallocated surplus of a non-resident file is given back by
+ * the flush. Needs a 256 MiB image:
+ * the write cache only preallocates when the volume has more than four
+ * times the preallocation free. */
+#define FT_T6_CHUNK (64 * 1024)
+
+static int ft_t6(ntfsb_device *dev, ntfsb_volume *v)
+{
+	const char *id = "t6";
+	unsigned char *p1, *p2, *buf;
+	uint32_t sector, cluster, mrs;
+	uint64_t ino, rounded;
+	int64_t mft_off, rs, re;
+	ntfsb_stat st;
+	char d[96];
+	int r, r1, r2, ur, ok;
+
+	p1 = malloc(FT_T6_CHUNK);
+	p2 = malloc(FT_T6_CHUNK);
+	buf = malloc(FT_T6_CHUNK);
+	if (!p1 || !p2 || !buf) {
+		fprintf(stderr, "flushtest: out of memory\n");
+		free(p1); free(p2); free(buf);
+		return 1;
+	}
+	ft_pattern(p1, FT_T6_CHUNK, 0x0a0a0a);
+	ft_pattern(p2, FT_T6_CHUNK, 0x0b0b0b);
+	/* two writes: the second grows the file past the resident limit and
+	 * the bridge allocates ahead of it */
+	r = ntfsb_create(v, NTFSB_ROOT_INO, "a.bin", S_IFREG, &st);
+	if (!r && ntfsb_write(v, st.ino, p1, FT_T6_CHUNK, 0) != FT_T6_CHUNK)
+		r = -EIO;
+	if (!r && ntfsb_write(v, st.ino, p2, FT_T6_CHUNK, FT_T6_CHUNK)
+			!= FT_T6_CHUNK)
+		r = -EIO;
+	if (r || boot_geometry(&sector, &cluster, &mrs, &mft_off)) {
+		fprintf(stderr, "flushtest t6: setup failed\n");
+		free(p1); free(p2); free(buf);
+		return 1;
+	}
+	ino = st.ino;
+	ino_record_range(mft_off, mrs, ino, &rs, &re);
+	printf("[%s] geometry: sector %u cluster %u mft_record %u; target "
+		"ino %llu mft_record %lld..%lld\n", id, sector, cluster, mrs,
+		(unsigned long long)ino, (long long)rs, (long long)re);
+	r = ntfsb_getattr(v, ino, &st);
+	rounded = ((uint64_t)2 * FT_T6_CHUNK + cluster - 1) & ~(uint64_t)(cluster - 1);
+	if (r) {
+		ft_assert(id, "stat of A after the writes", 0, ft_rc(r));
+	} else {
+		snprintf(d, sizeof(d), "got %llu",
+			(unsigned long long)st.size);
+		ft_assert(id, "A has the written size",
+			st.size == (uint64_t)2 * FT_T6_CHUNK, d);
+		snprintf(d, sizeof(d), "alloc %llu, cluster-rounded size %llu",
+			(unsigned long long)st.alloc_size,
+			(unsigned long long)rounded);
+		/* proves the surplus exists, so the sync really takes the
+	 * trim path */
+		ft_assert(id, "A is over-allocated before the sync",
+			st.alloc_size > rounded, d);
+	}
+	ft_arm(id, rs, re, EIO, 1, 0);
+	r1 = ntfsb_sync(v);
+	r2 = ntfsb_sync(v);
+	ur = ntfsb_unmount(v);
+	ft_assert(id, "first ntfsb_sync returns -EIO", r1 == -EIO, ft_rc(r1));
+	ft_assert(id, "the target range saw at least one failed write",
+		g_fault.failures > 0,
+		ft_ll("failures", (long long)g_fault.failures));
+	ft_assert(id, "second ntfsb_sync returns 0", r2 == 0, ft_rc(r2));
+	ft_assert(id, "unmount after the successful retry returns 0",
+		ur == 0, ft_rc(ur));
+	fault_disarm();
+	v = ft_remount(dev);
+	ft_assert(id, "image remounts", v != NULL, v ? "" : "mount failed");
+	if (v) {
+		r = resolve(v, "/a.bin", &ino, &st);
+		if (r) {
+			ft_assert(id, "A resolves after remount", 0, ft_rc(r));
+		} else {
+			snprintf(d, sizeof(d), "got %llu",
+				(unsigned long long)st.size);
+			ft_assert(id, "A size survived",
+				st.size == (uint64_t)2 * FT_T6_CHUNK, d);
+			snprintf(d, sizeof(d), "alloc %llu, want %llu",
+				(unsigned long long)st.alloc_size,
+				(unsigned long long)rounded);
+			ft_assert(id, "surplus trimmed to the cluster-rounded "
+				"size", st.alloc_size == rounded, d);
+		}
+		ok = !r;
+		if (!r && ntfsb_read(v, ino, buf, FT_T6_CHUNK, 0)
+				!= FT_T6_CHUNK)
+			ok = 0;
+		if (ok && memcmp(buf, p1, FT_T6_CHUNK))
+			ok = 0;
+		if (ok && ntfsb_read(v, ino, buf, FT_T6_CHUNK, FT_T6_CHUNK)
+				!= FT_T6_CHUNK)
+			ok = 0;
+		if (ok && memcmp(buf, p2, FT_T6_CHUNK))
+			ok = 0;
+		ft_assert(id, "A content survived", ok,
+			ok ? "" : "read back mismatch");
+		ur = ntfsb_unmount(v);
+		ft_assert(id, "final unmount returns 0", ur == 0, ft_rc(ur));
+	}
+	free(p1);
+	free(p2);
+	free(buf);
+	return ft_done(id);
+}
+
+/*
+ * Shared setup of t7/t7b: /d with 60 filler files (its $I30 index grows
+ * into a non-resident allocation) and /d/a.bin with 4096 bytes, whose
+ * directory entry must be updated when the write cache is flushed.
+ * Also reads the committed $I30 index allocation range.
+ */
+static int ft_t7_setup(ntfsb_volume *v, uint64_t *dino, uint64_t *aino,
+		int64_t *rs, int64_t *re)
+{
+	ntfs_volume *h;
+	ntfs_inode *dni;
+	ntfs_attr *na;
+	ntfsb_stat st;
+	char name[16];
+	int r, i;
+
+	r = ntfsb_create(v, NTFSB_ROOT_INO, "d", S_IFDIR, &st);
+	if (r) {
+		fprintf(stderr, "flusftest: mkdir /d failed: %s\n", strerror(-r));
+		return -1;
+	}
+	*dino = st.ino;
+	for (i = 0; i < 60; i++) {
+		snprintf(name, sizeof(name), "f%02d", i);
+		if (ft_make_file_at(v, *dino, name, 10, 0x100 + i, aino)) {
+			fprintf(stderr, "flusftest: filler setup failed\n");
+			return -1;
+		}
+	}
+	r = ntfsb_create(v, *dino, "a.bin", S_IFREG, &st);
+	if (r) {
+		fprintf(stderr, "flusftest: a.bin setup failed: %s\n",
+			strerror(-r));
+		return -1;
+	}
+	*aino = st.ino;
+	for (i = 0; i < 8; i++) {
+		unsigned char piece[512];
+
+		ft_pattern(piece, sizeof(piece), 0x0d0d0d + i);
+		if (ntfsb_write(v, *aino, piece, sizeof(piece),
+				(int64_t)i * 512) != 512) {
+			fprintf(stderr, "flusftest: a.bin write failed\n");
+			return -1;
+		}
+	}
+
+	/* the committed index allocation range, through the independent
+	 * read-only helper mount (nothing is hardcoded) */
+	h = helper_mount();
+	if (!h)
+		return -1;
+	dni = ntfs_inode_open(h, *dino);
+	na = dni ? ntfs_attr_open(dni, AT_INDEX_ALLOCATION, NTFS_INDEX_I30, 4)
+		 : NULL;
+	if (!na) {
+		fprintf(stderr, "flusftest: $I30 has no non-resident "
+			"index allocation\n");
+		if (dni)
+			ntfs_inode_close(dni);
+		helper_umount(h);
+		return -1;
+	}
+	r = attr_data_range(na, rs, re);
+	ntfs_attr_close(na);
+	ntfs_inode_close(dni);
+	helper_umount(h);
+	if (r) {
+		fprintf(stderr, "flusftest: the index allocation range is "
+			"fragmented\n");
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * Reads the data_size recorded in /d's directory entry for a.bin and
+ * whether that entry lives in a non-resident index block.
+ */
+static int ft_t7_dir_entry(uint64_t dino, int64_t *entry_size,
+		int *in_allocation)
+{
+	ntfs_volume *h;
+	ntfs_inode *dni;
+	ntfs_index_context *icx = NULL;
+	ntfschar *uname = NULL;
+	int ulen = 0;
+
+	*entry_size = -1;
+	*in_allocation = 0;
+	h = helper_mount();
+	if (!h)
+		return -1;
+	dni = ntfs_inode_open(h, dino);
+	if (dni) {
+		ulen = ntfs_mbstoucs("a.bin", &uname);
+		if (ulen >= 0)
+			icx = ntfs_index_ctx_get(dni, NTFS_INDEX_I30, 4);
+	}
+	/* the lookup key for COLLATION_FILE_NAME is a FILE_NAME_ATTR */
+	if (icx && uname && ulen > 0 && (size_t)ulen <= NTFS_MAX_NAME_LEN) {
+		unsigned char keybuf[128];
+		FILE_NAME_ATTR *key = (FILE_NAME_ATTR *)keybuf;
+
+		memset(keybuf, 0, sizeof(keybuf));
+		key->file_name_length = ulen;
+		memcpy(key->file_name, uname, ulen * sizeof(ntfschar));
+		if (ntfs_index_lookup((char *)key, ulen, icx) == 0
+		    && icx->data_len >= sizeof(FILE_NAME_ATTR)) {
+			FILE_NAME_ATTR *fn = (FILE_NAME_ATTR *)icx->data;
+
+			*entry_size = sle64_to_cpu(fn->data_size);
+			*in_allocation = !icx->is_in_root;
+		}
+	}
+	if (icx)
+		ntfs_index_ctx_put(icx);
+	if (dni)
+		ntfs_inode_close(dni);
+	free(uname);
+	helper_umount(h);
+	return 0;
+}
+
+/* T7: one write into the non-resident $I30 allocation fails during
+ * the first sync; the swallowed failure must still fail the sync and the
+ * retry must update the directory entry. The entry is verified after the
+ * second sync, before the unmount. */
+static int ft_t7(ntfsb_device *dev, ntfsb_volume *v)
+{
+	const char *id = "t7";
+	int64_t rs, re, entry_size;
+	uint64_t dino, aino;
+	char d[96];
+	int r1, r2, ur, in_allocation = 0;
+
+	(void)dev;
+	if (ft_t7_setup(v, &dino, &aino, &rs, &re))
+		return 1;
+	printf("[%s] target: /d $I30 index allocation %lld..%lld\n", id,
+		(long long)rs, (long long)re);
+
+	ft_arm(id, rs, re, EIO, 1, 0);
+	r1 = ntfsb_sync(v);
+	r2 = ntfsb_sync(v);
+	ft_assert(id, "first ntfsb_sync returns an error (the failed index "
+		"write is not swallowed)", r1 == -EIO, ft_rc(r1));
+	ft_assert(id, "the index allocation saw a failed write",
+		g_fault.failures > 0,
+		ft_ll("failures", (long long)g_fault.failures));
+	ft_assert(id, "second ntfsb_sync returns 0", r2 == 0, ft_rc(r2));
+	/* verify while the bridge volume is still mounted */
+	if (ft_t7_dir_entry(dino, &entry_size, &in_allocation))
+		return 1;
+	snprintf(d, sizeof(d), "dir entry size %lld, want 4096",
+		(long long)entry_size);
+	ft_assert(id, "the directory entry carries the written size",
+		entry_size == 4096, d);
+	ft_assert(id, "the entry lives in a non-resident index block",
+		in_allocation, in_allocation ? "" : "in the index root");
+	ur = ntfsb_unmount(v);
+	fault_disarm();
+	ft_assert(id, "unmount returns 0", ur == 0, ft_rc(ur));
+	return ft_done(id);
+}
+
+/* T7b: in one sync BOTH the $I30 index write and the file's MFT
+ * record write fail once. The sync reports the error, but its FILE_NAME
+ * dirty mark is already cleared; a retry that only rewrites the MFT
+ * record would lose the directory entry update. */
+static int ft_t7b(ntfsb_device *dev, ntfsb_volume *v)
+{
+	const char *id = "t7b";
+	uint32_t sector, cluster, mrs;
+	int64_t mft_off, is, ie, ars, are, entry_size;
+	uint64_t dino, aino;
+	char d[96];
+	int r1, r2, ur, in_allocation = 0;
+
+	(void)dev;
+	if (ft_t7_setup(v, &dino, &aino, &is, &ie)
+	    || boot_geometry(&sector, &cluster, &mrs, &mft_off))
+		return 1;
+	ino_record_range(mft_off, mrs, aino, &ars, &are);
+	printf("[%s] targets: /d $I30 allocation %lld..%lld, a.bin record "
+		"%lld..%lld\n", id, (long long)is, (long long)ie,
+		(long long)ars, (long long)are);
+
+	ft_arm(id, is, ie, EIO, 1, 0);
+	fault_arm_at(&g_fault2, ars, are, EIO, 1);
+	printf("[%s] injection armed: range [%lld,%lld) errno %d mode once\n",
+		id, (long long)ars, (long long)are, EIO);
+	r1 = ntfsb_sync(v);
+	r2 = ntfsb_sync(v);
+	ft_assert(id, "first ntfsb_sync returns -EIO (both writes failed)",
+		r1 == -EIO, ft_rc(r1));
+	ft_assert(id, "the index allocation write failed exactly once",
+		g_fault.failures == 1,
+		ft_ll("failures", (long long)g_fault.failures));
+	ft_assert(id, "the MFT record write failed exactly once",
+		g_fault2.failures == 1,
+		ft_ll("failures", (long long)g_fault2.failures));
+	ft_assert(id, "the sync after the faults cleared returns 0",
+		r2 == 0, ft_rc(r2));
+	if (ft_t7_dir_entry(dino, &entry_size, &in_allocation))
+		return 1;
+	snprintf(d, sizeof(d), "dir entry size %lld, want 4096",
+		(long long)entry_size);
+	ft_assert(id, "the retry updated the directory entry too",
+		entry_size == 4096, d);
+	ft_assert(id, "the entry lives in a non-resident index block",
+		in_allocation, in_allocation ? "" : "in the index root");
+	ur = ntfsb_unmount(v);
+	fault_disarm();
+	ft_assert(id, "unmount returns 0", ur == 0, ft_rc(ur));
+	return ft_done(id);
+}
+
+
+/* T8: a failure while trimming the preallocation leaves bitmap,
+ * runlist and attribute sizes partially updated, so the trim is not
+ * retryable. One $Bitmap write is failed during the trim; afterwards
+ * the volume must fail closed until it is unmounted (and marked dirty). */
+static int ft_t8(ntfsb_device *dev, ntfsb_volume *v)
+{
+	const char *id = "t8";
+	unsigned char chunk[FT_T6_CHUNK];
+	ntfs_volume *h;
+	ntfs_inode *bni;
+	ntfs_attr *na;
+	int64_t rs, re;
+	uint64_t ino;
+	ntfsb_stat st;
+	char d[96];
+	int r, r1, r2, rm, ur, dirty = 0, clean0 = 0;
+	int64_t w;
+	unsigned long nw1, nw2;
+
+	(void)dev;
+	/* two writes like t6: the second triggers the preallocation */
+	ft_pattern(chunk, sizeof(chunk), 0x0e0e0e);
+	r = ntfsb_create(v, NTFSB_ROOT_INO, "a.bin", S_IFREG, &st);
+	if (!r && ntfsb_write(v, st.ino, chunk, sizeof(chunk), 0)
+			!= (int64_t)sizeof(chunk))
+		r = -EIO;
+	if (!r && ntfsb_write(v, st.ino, chunk, sizeof(chunk),
+				(int64_t)sizeof(chunk)) != (int64_t)sizeof(chunk))
+		r = -EIO;
+	if (r) {
+		fprintf(stderr, "flushtest t8: setup failed\n");
+		return 1;
+	}
+	ino = st.ino;
+
+	/* the volume must start clean, so the dirty check at the end
+	 * proves the unmount marked it */
+	h = helper_mount();
+	if (!h)
+		return 1;
+	clean0 = (h->flags & VOLUME_IS_DIRTY) == 0;
+	helper_umount(h);
+	ft_assert(id, "the volume is not dirty before the injection",
+		clean0, clean0 ? "" : "VOLUME_IS_DIRTY already set");
+
+	/* the $Bitmap data range (written first when the trim frees the
+	 * preallocated clusters) */
+	h = helper_mount();
+	if (!h)
+		return 1;
+	bni = ntfs_inode_open(h, FILE_Bitmap);
+	na = bni ? ntfs_attr_open(bni, AT_DATA, AT_UNNAMED, 0) : NULL;
+	if (!na) {
+		fprintf(stderr, "flushtest t8: cannot open $Bitmap\n");
+		if (bni)
+			ntfs_inode_close(bni);
+		helper_umount(h);
+		return 1;
+	}
+	r = attr_data_range(na, &rs, &re);
+	ntfs_attr_close(na);
+	ntfs_inode_close(bni);
+	helper_umount(h);
+	if (r) {
+		fprintf(stderr, "flushtest t8: $Bitmap is fragmented\n");
+		return 1;
+	}
+	printf("[%s] target: $Bitmap data %lld..%lld\n", id,
+		(long long)rs, (long long)re);
+
+	ft_arm(id, rs, re, EIO, 1, 0);
+	r1 = ntfsb_sync(v);
+	/* from fail-closed to just before the unmount not a single device
+	 * write may happen (the unmount's abandon path and dirty marking
+	 * are not counted) */
+	nw1 = g_nw;
+	r2 = ntfsb_sync(v);
+	rm = ntfsb_create(v, NTFSB_ROOT_INO, "m", S_IFDIR, &st);
+	w = ntfsb_write(v, ino, chunk, sizeof(chunk),
+		(int64_t)2 * sizeof(chunk));
+	nw2 = g_nw;
+	ur = ntfsb_unmount(v);
+	fault_disarm();
+	ft_assert(id, "the trim itself reports -EIO", r1 == -EIO, ft_rc(r1));
+	ft_assert(id, "the target range saw a failed write",
+		g_fault.failures > 0,
+		ft_ll("failures", (long long)g_fault.failures));
+	ft_assert(id, "the next ntfsb_sync still returns -EIO (fail closed)",
+		r2 == -EIO, ft_rc(r2));
+	ft_assert(id, "a modifying operation returns -EIO",
+		rm == -EIO, ft_rc(rm));
+	snprintf(d, sizeof(d), "got %lld", (long long)w);
+	ft_assert(id, "ntfsb_write returns -EIO", w == -EIO, d);
+	snprintf(d, sizeof(d), "got %lu writes", nw2 - nw1);
+	ft_assert(id, "no device write happens while fail-closed",
+		nw2 == nw1, d);
+	ft_assert(id, "unmount returns -EIO", ur == -EIO, ft_rc(ur));
+
+	/* the volume must be marked dirty for Windows' chkdsk; the helper
+	 * mount is read-only, so it cannot change the flag itself */
+	h = helper_mount();
+	if (h) {
+		dirty = (h->flags & VOLUME_IS_DIRTY) != 0;
+		helper_umount(h);
+	}
+	snprintf(d, sizeof(d), "VOLUME_IS_DIRTY is %d", dirty);
+	ft_assert(id, "the volume is marked dirty after remount",
+		dirty, d);
+	return ft_done(id);
+}
+
+/* T9: the release of a file whose inode is not cached reads its
+ * MFT record. One read failure during that release must reach the C
+ * ledger, so the next ntfsb_sync reports it. */
+static int ft_t9(ntfsb_device *dev, ntfsb_volume *v)
+{
+	const char *id = "t9";
+	int64_t rs, re;
+	uint64_t ino, xino;
+	char name[16];
+	int i, rr, r1, r2, ur;
+
+	(void)dev;
+	if (ft_make_file(v, "a.bin", 256, 0x0f0f0f, &ino)
+	    || ft_target(id, ino, &rs, &re))
+		return 1;
+	/* flush a.bin into the inode cache, then push it out again with
+	 * more than CACHE_NIDATA_SIZE (64) other closes */
+	if (ntfsb_sync(v)) {
+		fprintf(stderr, "flusftest t9: setup sync failed\n");
+		return 1;
+	}
+	for (i = 0; i < 70; i++) {
+		snprintf(name, sizeof(name), "r%02d", i);
+		if (ft_make_file(v, name, 10, 0x200 + i, &xino)) {
+			fprintf(stderr, "flusftest t9: filler setup failed\n");
+			return 1;
+		}
+	}
+	if (ntfsb_sync(v)) {
+		fprintf(stderr, "flusftest t9: filler sync failed\n");
+		return 1;
+	}
+
+	/* one read failure when the release opens a.bin's record */
+	fault_arm_at(&g_fault_rd, rs, re, EIO, 1);
+	printf("[%s] read injection armed: range [%lld,%lld) errno %d "
+		"mode once\n", id, (long long)rs, (long long)re, EIO);
+	rr = ntfsb_release(v, ino);
+	r1 = ntfsb_sync(v);
+	r2 = ntfsb_sync(v);
+	ur = ntfsb_unmount(v);
+	fault_disarm();
+	ft_assert(id, "the release itself returns -EIO", rr == -EIO,
+		ft_rc(rr));
+	ft_assert(id, "the record read failed exactly once",
+		g_fault_rd.failures == 1,
+		ft_ll("failures", (long long)g_fault_rd.failures));
+	ft_assert(id, "the next ntfsb_sync reports the release error",
+		r1 == -EIO, ft_rc(r1));
+	ft_assert(id, "and only once", r2 == 0, ft_rc(r2));
+	ft_assert(id, "unmount returns 0", ur == 0, ft_rc(ur));
+	return ft_done(id);
+}
+
+static int flushtest(ntfsb_device *dev, ntfsb_volume *v, const char *name)
+{
+	if (!strcmp(name, "t1"))
+		return ft_t1(dev, v);
+	if (!strcmp(name, "t2"))
+		return ft_t2(dev, v);
+	if (!strcmp(name, "t3"))
+		return ft_t3(dev, v);
+	if (!strcmp(name, "t4"))
+		return ft_t4(dev, v);
+	if (!strcmp(name, "t5"))
+		return ft_t5(dev, v);
+	if (!strcmp(name, "t6"))
+		return ft_t6(dev, v);
+	if (!strcmp(name, "t7"))
+		return ft_t7(dev, v);
+	if (!strcmp(name, "t8"))
+		return ft_t8(dev, v);
+	if (!strcmp(name, "t7b"))
+		return ft_t7b(dev, v);
+	if (!strcmp(name, "t9"))
+		return ft_t9(dev, v);
+	fprintf(stderr, "ntfstool: unknown flushtest case %s (t1-t9)\n", name);
+	return 64;
+}
+
 /* Every command main() dispatches, and whether it opens the image
  * read-only. Returns 1 (read-only), 0 (read-write) or -1 (unknown). */
 static int command_mode(const char *cmd)
@@ -377,11 +1694,11 @@ static int command_mode(const char *cmd)
 	static const struct { const char *name; int ro; } commands[] = {
 		{ "probe", 1 }, { "check", 1 }, { "info", 1 }, { "ls", 1 },
 		{ "stat", 1 }, { "cat", 1 }, { "get", 1 }, { "readlink", 1 },
-		{ "getxattr", 1 }, { "listxattr", 1 },
+		{ "getxattr", 1 }, { "listxattr", 1 }, { "mftoff", 1 },
 		{ "format", 0 }, { "repair", 0 }, { "put", 0 }, { "mkdir", 0 },
 		{ "rm", 0 }, { "mv", 0 }, { "ln", 0 }, { "symlink", 0 },
 		{ "truncate", 0 }, { "setxattr", 0 }, { "rmxattr", 0 },
-		{ "label", 0 }, { "stress", 0 },
+		{ "label", 0 }, { "stress", 0 }, { "flushtest", 0 },
 	};
 	size_t i;
 
@@ -417,6 +1734,7 @@ int main(int argc, char **argv)
 		return 64;
 	}
 	atexit(io_stats);
+	g_image = argv[1];
 	g_fd = open(argv[1], ro ? O_RDONLY : O_RDWR);
 	if (g_fd < 0 || fstat(g_fd, &hst)) {
 		perror(argv[1]);
@@ -620,9 +1938,28 @@ int main(int argc, char **argv)
 	} else if (!strcmp(cmd, "label")) {
 		NEED(1);
 		r = ntfsb_set_label(v, argv[3]);
+	} else if (!strcmp(cmd, "mftoff")) {
+		uint32_t sector, cluster, mrs;
+		int64_t mft_off, rs, re;
+
+		NEED(1);
+		r = resolve(v, argv[3], &ino, NULL);
+		if (!r && boot_geometry(&sector, &cluster, &mrs, &mft_off)) {
+			fprintf(stderr, "ntfstool: cannot parse the boot sector\n");
+			r = -EINVAL;
+		}
+		if (!r) {
+			ino_record_range(mft_off, mrs, ino, &rs, &re);
+			printf("%s: ino %llu mft_record %lld..%lld\n", argv[3],
+				(unsigned long long)ino,
+				(long long)rs, (long long)re);
+		}
 	} else if (!strcmp(cmd, "stress")) {
 		NEED(2);
 		return stress(&dev, v, strtoull(argv[3], NULL, 0), atoi(argv[4]));
+	} else if (!strcmp(cmd, "flushtest")) {
+		NEED(1);
+		return flushtest(&dev, v, argv[3]);
 	} else {
 		fprintf(stderr, "ntfstool: unknown command %s\n", cmd);
 		r = -EINVAL;

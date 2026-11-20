@@ -5,7 +5,7 @@ Read-write NTFS for macOS 27+ on Apple silicon, built as an FSKit file system ex
 [libntfs-3g](https://github.com/tuxera/ntfs-3g); this project adds a C bridge,
 the FSKit module and a menu bar app.
 
-Status: 0.2.0 is an early release. It has been tested on a single Mac
+Status: 0.2.1 is an early release. It has been tested on a single Mac
 (macOS 27.2) with a USB flash drive and with disk images. Other kinds of
 disks (external SSDs, hard drives) have not been tested, and no performance
 measurements have been made. Back up important data.
@@ -134,12 +134,15 @@ your user account.
     build/ntfstool t.img format Test
     build/ntfstool t.img stress 1 3000
 
-Offline tests (they use disposable files under `build/` or recording stubs and
-do not touch real disks, `/Volumes` or `/Applications`):
+Offline tests (they use disposable files under `build/` or the system
+temporary directory, or recording stubs, and do not touch real disks,
+`/Volumes` or `/Applications`):
 
 | Target | What it checks |
 |---|---|
 | `make maint-repair-test` | verify / repair engine (ntfsfix through `ntfstool`) on a disk image |
+| `make flush-error-test` | C core: device read / write fault injection on a disk image (ASan + `leaks`): failed metadata commits are reported by sync, unmount and the modifying call points |
+| `make extension-error-test` | Swift decision logic only (no FSKit, no C core): the extension's error ledger and release / unmount handoff decisions |
 | `make ntfstool-cmd-test` | `ntfstool` rejects unknown commands before opening the image |
 | `make install-script-test` | `Tools/install.sh` with stubbed build and system tools |
 | `make lease-store-test` | the helper's grant journal, device checks and remount policy |
@@ -158,6 +161,32 @@ do not touch real disks, `/Volumes` or `/Applications`):
   and are ignored.
 - A volume from a hibernated / fast-startup Windows, or with a journal that
   cannot be reset, is mounted read-only.
+- The metadata of the file being written is committed later, when another
+  operation or a sync needs it. If that commit fails (failing media,
+  unplugged drive), the error is kept until a sync or the unmount reports
+  it, even when a later retry succeeds. While the commit keeps failing,
+  every operation that has to commit first (create, hard link, rename,
+  remove, truncate, set times / flags / label, extended attributes,
+  writing to a different file, and a close that has to release the file)
+  returns the error and does not carry out the requested change; the
+  failed commit attempt itself may already have written part of the
+  metadata. Reads, and further writes to the file whose commit failed,
+  continue. Errors are
+  delivered through the `synchronize`, `deactivateVolume` and
+  `unloadResource` callbacks; FSKit's `unmount` callback has no error
+  channel, so an error found there is reported by the next of those three.
+- If the commit still fails at unmount, the pending update is dropped and
+  the error is reported; the disk may then hold partially committed
+  metadata. Run chkdsk on Windows before using the volume there.
+- If giving back space that was allocated ahead fails part way, the volume
+  fails closed: every write, every operation above and every sync returns
+  an error until it is unmounted. Reads continue. At unmount OpenNTFS tries
+  to mark the volume dirty, which may make Windows offer to scan it; run
+  chkdsk on Windows yourself before using the volume there.
+- Known limitation: while a directory's own metadata writes keep failing,
+  each sync attempt can leak one inode of that parent directory (memory
+  only, no data damage). The leaked memory is only returned when the file
+  system extension process exits.
 - Verify / repair is ntfsfix, not a full chkdsk. After a **repair**, Windows
   may ask to "scan and fix" the drive the next time it is plugged in. This is
   intended: like upstream ntfsfix, the repair marks the volume dirty so that

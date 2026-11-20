@@ -45,6 +45,9 @@ final class NTFSVolume: FSVolume {
     private var handle: OpaquePointer?
     private let device: BlockDevice
     private var items: [UInt64: NTFSItem] = [:]
+    /// Flush/release error handoff state; every access
+    /// happens under `Core.sync`, like the bridge calls it dispatches.
+    private let errorState = VolumeErrorState()
     private let root: NTFSItem
     private(set) var isReadOnly: Bool
     private var clusterSize: UInt64 = 4096
@@ -70,15 +73,20 @@ final class NTFSVolume: FSVolume {
         }
     }
 
-    /// Flush and close the NTFS volume. Safe to call more than once.
-    func shutdown() {
+    /// Flush, release and unmount the NTFS volume, combining the unmount
+    /// result with the error ledger, where a stored error outranks a
+    /// fresh one. Safe to call more than
+    /// once. Returns the positive errno to report, or 0.
+    func shutdown() -> Int32 {
         Core.sync {
-            guard let h = handle else { return }
-            releasePending(h)
-            let r = ntfsb_unmount(h)
-            if r != 0 { log.error("unmount failed: \(r)") }
+            guard let h = handle else { return 0 }
+            let status = errorState.shutdownResult(
+                releasePending: { releasePending(h, clearAlways: true) },
+                unmount: { ntfsb_unmount(h) })
             handle = nil
             items.removeAll()
+            if status != 0 { log.error("shutdown finished with error \(status)") }
+            return status
         }
     }
 
@@ -170,6 +178,11 @@ final class NTFSVolume: FSVolume {
             return existing
         }
         let n = NTFSItem(ino: st.ino, isDirectory: isDir)
+        // a release that failed during a reclaim is still owed for this
+        // ino: the fresh item inherits it
+        if errorState.lookupInheritsPendingRelease(st.ino) {
+            n.needsRelease = true
+        }
         items[st.ino] = n
         return n
     }
@@ -214,11 +227,16 @@ final class NTFSVolume: FSVolume {
         return (st, actual.map { String(cString: $0) } ?? name)
     }
 
-    private func releasePending(_ h: OpaquePointer) {
-        for (_, n) in items where n.needsRelease {
-            _ = ntfsb_release(h, n.ino)
-            n.needsRelease = false
+    /// One release pass: flagged items first, then the inos
+    /// whose release failed during a reclaim. `clearAlways` is the
+    /// shutdown exception: item flags are cleared regardless of the
+    /// outcome and the error goes to the ledger.
+    private func releasePending(_ h: OpaquePointer, clearAlways: Bool = false) {
+        let flagged = items.values.filter(\.needsRelease).map { n in
+            (ino: n.ino, clear: { n.needsRelease = false })
         }
+        errorState.releasePending(flagged: flagged, clearAlways: clearAlways,
+                                  release: { ntfsb_release(h, $0) })
     }
 
     private func readDirectory(_ h: OpaquePointer, _ dir: NTFSItem) throws -> [DirEntry] {
@@ -319,7 +337,8 @@ extension NTFSVolume: FSVolume.Handler {
         Core.sync {
             if let h = handle {
                 releasePending(h)
-                syncError = ntfsb_sync(h)
+                // reporting boundary: a stored error outranks this attempt
+                syncError = errorState.boundary(ntfsb_sync(h))
             }
         }
         reply(syncError == 0 ? nil : posixError(syncError))
@@ -338,6 +357,10 @@ extension NTFSVolume: FSVolume.Handler {
                 let r = ntfsb_sync(h)
                 if r != 0 {
                     log.error("unmount sync failed: \(r)")
+                    // no error channel here: whichever of synchronize,
+                    // deactivateVolume or unloadResource runs first
+                    // reports it
+                    errorState.record(r)
                 }
             }
         }
@@ -345,10 +368,12 @@ extension NTFSVolume: FSVolume.Handler {
     }
 
     func synchronize(flags: FSSyncFlags, replyHandler reply: @escaping ((any Error)?) -> Void) {
+        log.info("synchronize")
         let r: Int32 = Core.sync {
             guard let h = handle else { return 0 }
             releasePending(h)
-            return ntfsb_sync(h)
+            // reporting boundary: a stored error outranks this attempt
+            return errorState.boundary(ntfsb_sync(h))
         }
         reply(r == 0 ? nil : posixError(r))
     }
@@ -362,11 +387,17 @@ extension NTFSVolume: FSVolume.Handler {
         Core.sync {
             guard let n = item as? NTFSItem else { return }
             wasReclaimed = n.tryReclaim {
+                // the tested decision path: a failed
+                // release is replied and the ino retried later; the
+                // error itself is bookkept by the C ledger
                 var err: Int32 = 0
-                if n.needsRelease, let h = self.handle {
-                    let r = ntfsb_release(h, n.ino)
+                if let h = self.handle {
+                    err = self.errorState.reclaimRelease(
+                        ino: n.ino, needsRelease: n.needsRelease,
+                        release: { ntfsb_release(h, $0) })
+                }
+                if err == 0 {
                     n.needsRelease = false
-                    if r != 0 && err == 0 { err = r }
                 }
                 n.listing = nil
                 if n !== self.root, self.items[n.ino] === n {
@@ -429,6 +460,9 @@ extension NTFSVolume: FSVolume.Handler {
         try check(ntfsb_create(h, dir.ino, diskName, mode, &st))
         touch(dir)
         items[st.ino] = nil  // a recycled MFT record is a brand new file
+        if errorState.discardPendingRelease(st.ino) {
+            log.error("MFT record \(st.ino) was recycled while one of its releases was still pending")
+        }
         let n = item(for: st)
         st = try applyAttributes(h, newAttributes, to: n, initial: true) ?? st
         return (n, FSFileName(string: diskName), attributes(st),
@@ -447,6 +481,9 @@ extension NTFSVolume: FSVolume.Handler {
             try check(ntfsb_symlink(h, dir.ino, diskName, target, &st))
             touch(dir)
             items[st.ino] = nil
+            if errorState.discardPendingRelease(st.ino) {
+                log.error("MFT record \(st.ino) was recycled while one of its releases was still pending")
+            }
             let n = item(for: st)
             newAttributes.consumedAttributes = [.mode, .uid, .gid]
             return FSCreateSymlinkResult(newItem: n,
@@ -490,12 +527,19 @@ extension NTFSVolume: FSVolume.Handler {
             var overStat: ntfsb_stat?
             if let over, over !== n {
                 overStat = try? stat(h, over.ino)
-                if over.needsRelease {
-                    _ = ntfsb_release(h, over.ino)
-                    over.needsRelease = false
-                }
             }
-            try check(ntfsb_rename(h, src.ino, oldName, dst.ino, newName))
+            // release the previous writer first; a failed release stops
+            // the rename
+            var renameR: Int32 = 0
+            let pre = errorState.releaseBeforeAction(
+                ino: over?.ino ?? 0,
+                needsRelease: over.map { $0 !== n && $0.needsRelease } ?? false,
+                release: { ntfsb_release(h, $0) }) {
+                renameR = ntfsb_rename(h, src.ino, oldName, dst.ino, newName)
+            }
+            if pre != 0 { throw posixError(pre) }
+            if let over, over !== n, over.needsRelease { over.needsRelease = false }
+            try check(renameR)
             touch(src)
             touch(dst)
 
@@ -526,12 +570,18 @@ extension NTFSVolume: FSVolume.Handler {
             let dir = try node(directory)
             let (found, actual) = try lookup(h, dir.ino, try string(name))
             guard found.ino == n.ino else { throw posixError(ESTALE) }
-            if n.needsRelease {
-                _ = ntfsb_release(h, n.ino)
-                n.needsRelease = false
+            // release the previous writer first; a failed release stops
+            // the removal
+            var removeR: Int32 = 0
+            let pre = errorState.releaseBeforeAction(
+                ino: n.ino, needsRelease: n.needsRelease,
+                release: { ntfsb_release(h, $0) }) {
+                removeR = ntfsb_remove(h, dir.ino, actual)
             }
+            if pre != 0 { throw posixError(pre) }
+            if n.needsRelease { n.needsRelease = false }
             var st = found
-            try check(ntfsb_remove(h, dir.ino, actual))
+            try check(removeR)
             touch(dir)
             if st.nlink > 1, let now = try? stat(h, n.ino) {
                 st = now
@@ -717,14 +767,21 @@ extension NTFSVolume: FSVolume.OpenCloseHandler {
 
     func closeItem(_ item: FSItem, modes: FSVolume.OpenModes, context: FSContext,
                    replyHandler reply: @escaping ((any Error)?) -> Void) {
+        var releaseError: Int32 = 0
         Core.sync {
             if let n = item as? NTFSItem, n.needsRelease, !modes.contains(.write),
                let h = handle {
-                _ = ntfsb_release(h, n.ino)
-                n.needsRelease = false
+                let r = ntfsb_release(h, n.ino)
+                if r != 0 {
+                    // reported through the reply below; the flag stays
+                    // set for a retry
+                    releaseError = r
+                } else {
+                    n.needsRelease = false
+                }
             }
         }
-        reply(nil)
+        reply(releaseError == 0 ? nil : posixError(releaseError))
     }
 }
 
