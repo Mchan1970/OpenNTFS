@@ -85,7 +85,15 @@ final class BlockDevice {
                 }
             }
         }
-        io.sync = { _ in 0 }
+        io.sync = { ctx in
+            guard let ctx else {
+                log.info("io.sync -")
+                return 0
+            }
+            let dev = Unmanaged<BlockDevice>.fromOpaque(ctx).takeUnretainedValue()
+            log.info("io.sync \(dev.resource.bsdName, privacy: .public)")
+            return 0
+        }
     }
 }
 

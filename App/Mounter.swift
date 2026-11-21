@@ -20,6 +20,9 @@ struct CommandResult {
 struct MaintenanceOutcome {
     let result: CommandResult
     let repaired: Bool
+    /// Repair was requested but never run: the read-only precheck decided
+    /// the writable pass must not touch the volume.
+    var repairSkipped: Bool = false
 }
 
 enum Shell {
@@ -627,12 +630,21 @@ final class Mounter {
     /// composed status text. The three failure kinds (fsck result /
     /// permission-restore failure / remount outcome) stay separately
     /// expressable in the returned text.
+    ///
+    /// Repair on a volume OpenNTFS itself had mounted read-write is
+    /// preceded by a read-only precheck: only there does a clean `-n` pass
+    /// prove the writable repair has nothing left to do (`-n` skips the log
+    /// and hibernation checks that a read-write mount already settled), and
+    /// skipping the repair keeps ntfsfix from setting VOLUME_IS_DIRTY on a
+    /// healthy volume. A restore warning on the precheck blocks the repair
+    /// too — no write grant on top of an unresolved permission state.
     @discardableResult
     func runMaintenanceFlow(_ disk: NTFSDisk, repair: Bool) async -> String {
         let preservedLabel = Self.resolvedLabel(disk.label, mountPoint: disk.mountPoint)
         let shouldRemount = disk.isMounted
         let wasOurs = disk.isOurs
         let wasReadOnly = disk.readOnly
+        let precheckBeforeRepair = repair && shouldRemount && wasOurs && !wasReadOnly
         maintLog.info("maintenance flow mode=\(repair ? "repair" : "verify", privacy: .public) device=\(disk.devicePath, privacy: .public) label=\(preservedLabel, privacy: .public) wasOurs=\(wasOurs) wasReadOnly=\(wasReadOnly)")
         if disk.isMounted {
             do {
@@ -644,7 +656,24 @@ final class Mounter {
                 return "\(disk.label): \(error.localizedDescription)"
             }
         }
-        let outcome = await check(disk, repair: repair)
+        let outcome: MaintenanceOutcome
+        if precheckBeforeRepair {
+            let pre = await check(disk, repair: false)
+            if let warn = pre.result.restoreWarning, !warn.isEmpty {
+                maintLog.info("precheck restore warning, repair not run device=\(disk.devicePath, privacy: .public)")
+                outcome = MaintenanceOutcome(result: pre.result, repaired: false,
+                                              repairSkipped: true)
+            } else if pre.result.ok {
+                maintLog.info("precheck clean, repair skipped device=\(disk.devicePath, privacy: .public)")
+                outcome = MaintenanceOutcome(result: pre.result, repaired: false,
+                                              repairSkipped: true)
+            } else {
+                maintLog.info("precheck failed, repairing device=\(disk.devicePath, privacy: .public)")
+                outcome = await check(disk, repair: true)
+            }
+        } else {
+            outcome = await check(disk, repair: repair)
+        }
         var text = MaintenanceReport.checkStatusMessage(label: preservedLabel, repair: repair,
                                                         outcome: outcome)
         if shouldRemount {
@@ -713,8 +742,12 @@ enum MaintenanceReport {
         let result = outcome.result
         var text: String
         if result.ok {
-            if repair {
-                text = L("\(label): repair finished.", "\(label)：修复完成。")
+            if outcome.repairSkipped {
+                text = L("\(label): check passed; no repair needed, nothing was changed.",
+                         "\(label)：检查通过，未发现需要修复的问题，未做改动。")
+            } else if repair {
+                text = L("\(label): repair finished. Windows may offer to scan this disk next time; let it scan.",
+                         "\(label)：修复完成。Windows 下次插入时可能提示扫描，按提示扫描即可。")
             } else {
                 text = L("\(label): check passed; no problems found.",
                          "\(label)：检查通过，未发现问题。")

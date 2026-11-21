@@ -23,7 +23,7 @@
  *   ntfstool <image> stress <seed> <iterations>
  *   ntfstool <image> mftoff <path>            (byte range of the file's MFT record,
  *                                              read from the boot sector)
- *   ntfstool <image> flushtest <t1..t9>
+ *   ntfstool <image> flushtest <case>
  *        Write-flush fault-injection regression. Injection is
  *        enabled only by this command, after the
  *        file data has been written; NTFSTOOL_FAIL_ERRNO and
@@ -31,6 +31,18 @@
  *        errnos because it exercises the priority between two of them).
  *        t6 and t8 need a 256 MiB image (preallocation requires the
  *        free space).
+ *
+ *        t10a/t10c need NTFSTOOL_IO_ALIGN as well: a mount-time device
+ *        I/O granularity larger than the $I30 index block, so the
+ *        index writeback of the flush takes bdev_pwrite()'s unaligned
+ *        read-modify-write path whose prefetch read failure nothing
+ *        records yet. Each case runs a record pass (on a copy of the
+ *        image, no injection) and a formal pass (on the original), and
+ *        fails exactly the recorded prefetch read. t10r stops after
+ *        the record pass: the reachability check of the unaligned
+ *        path (mount, unique covering read-modify-write); with
+ *        NTFSTOOL_IO_TRACE=1 every device transfer is printed with
+ *        its sequence number, type, offset and length.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -88,6 +100,20 @@ static struct ft_fault g_fault;     /* writes, primary range */
 static struct ft_fault g_fault2;    /* writes, second range (t7b) */
 static struct ft_fault g_fault_rd;  /* read faults (t9) */
 
+/* One-shot fault at a specific trace position (t10): the recorded
+ * prefetch read of one read-modify-write. When the operation at that
+ * position does not match the recorded shape, nothing is injected and
+ * the mismatch is remembered: the case is then not established. */
+static struct {
+	int armed;
+	unsigned long k;      /* 1-based position in the current trace */
+	int is_read;
+	int64_t off, len;
+	int short_read;       /* 0: fail with -EIO; 1: return 0 bytes with
+	                       * an unrelated residual errno (ENOENT) */
+	int hits, mismatch;
+} g_fault_k;
+
 static int fault_errno_name(const char *s, int fallback)
 {
 	if (!s || !*s)
@@ -137,6 +163,7 @@ static void fault_disarm(void)
 	g_fault2.failing = 0;
 	g_fault_rd.monitored = 0;
 	g_fault_rd.failing = 0;
+	g_fault_k.armed = 0;
 }
 
 /* Called from io_pwrite() for a write that intersects the range.
@@ -150,6 +177,64 @@ static int fault_hit(struct ft_fault *f)
 	if (f->once)
 		f->failing = 0;
 	return f->err;
+}
+
+/* ------------------------------------------------------ device I/O trace
+ *
+ * Every device-level transfer (one io_pread / io_pwrite call) with its
+ * return value, optionally echoed to stderr with its sequence number.
+ * The unaligned-write cases locate the read-modify-write of a specific
+ * index block by its shape in this sequence: a full-granularity read
+ * immediately followed by the covering write.
+ */
+struct io_ev {
+	char type;              /* 'R' or 'W' */
+	int64_t off, len, ret;
+};
+#define IO_EV_MAX 262144
+static struct io_ev g_ev[IO_EV_MAX];
+static unsigned long g_nev;
+static int g_ev_overflow;
+static int g_io_trace;
+
+static void io_trace_reset(void)
+{
+	g_nev = 0;
+	g_ev_overflow = 0;
+}
+
+static void io_trace_add(char type, int64_t off, int64_t len, int64_t ret)
+{
+	if (g_nev < IO_EV_MAX)
+		g_ev[g_nev] = (struct io_ev){ type, off, len, ret };
+	else
+		g_ev_overflow = 1;
+	g_nev++;
+	if (g_io_trace)
+		fprintf(stderr, "IO %lu %c %lld +%lld => %lld\n", g_nev, type,
+			(long long)off, (long long)len, (long long)ret);
+}
+
+/* Fail the operation at trace position k when its type, offset and
+ * length match the recorded ones. Returns 1 with *ret set to the
+ * failure the caller must return instead of transferring. */
+static int ft_k_fault_hit(int is_read, int64_t off, int64_t len, int64_t *ret)
+{
+	if (!g_fault_k.armed || g_nev + 1 != g_fault_k.k)
+		return 0;
+	if (is_read != g_fault_k.is_read || off != g_fault_k.off
+	    || len != g_fault_k.len) {
+		g_fault_k.mismatch = 1;
+		return 0;
+	}
+	g_fault_k.hits++;
+	if (g_fault_k.short_read) {
+		errno = ENOENT;       /* residual errno, unrelated to the
+		                       * short read itself */
+		*ret = 0;
+	} else
+		*ret = -EIO;
+	return 1;
 }
 
 /* -------------------------------------------------- NTFS boot sector
@@ -221,19 +306,27 @@ static void ino_record_range(int64_t mft_off, uint32_t mrs, uint64_t ino,
 static int64_t io_pread(void *ctx, void *buf, int64_t count, int64_t off)
 {
 	ssize_t r;
+	int64_t fret;
 
+	if (ft_k_fault_hit(1, off, count, &fret)) {
+		io_trace_add('R', off, count, fret);
+		return fret;
+	}
 	if (g_fault_rd.monitored && off < g_fault_rd.end
 	    && off + count > g_fault_rd.start) {
 		int err = fault_hit(&g_fault_rd);
 
-		if (err)
+		if (err) {
+			io_trace_add('R', off, count, -err);
 			return -err;
+		}
 	}
 	r = pread(g_fd, buf, count, off);
 	g_nr++;
 	if (getenv("NTFSTOOL_TRACE") && g_nw > 150 && g_nw < 175)
 		fprintf(stderr, "R %10lld +%lld\n", (long long)off, (long long)count);
 	(void)ctx;
+	io_trace_add('R', off, count, r < 0 ? -errno : r);
 	return r < 0 ? -errno : r;
 }
 
@@ -260,24 +353,36 @@ static void io_stats(void)
 			g_fault_rd.attempts, g_fault_rd.failures,
 			(long long)g_fault_rd.start, (long long)g_fault_rd.end,
 			g_fault_rd.err, g_fault_rd.once ? "once" : "always");
+	if (g_fault_k.armed)
+		fprintf(stderr, "k fault: position %lu, hits %d, mismatch %d\n",
+			g_fault_k.k, g_fault_k.hits, g_fault_k.mismatch);
 }
 
 static int64_t io_pwrite(void *ctx, const void *buf, int64_t count, int64_t off)
 {
 	ssize_t r;
+	int64_t fret;
 
+	if (ft_k_fault_hit(0, off, count, &fret)) {
+		io_trace_add('W', off, count, fret);
+		return fret;
+	}
 	if (g_fault.monitored && off < g_fault.end && off + count > g_fault.start) {
 		int err = fault_hit(&g_fault);
 
-		if (err)
+		if (err) {
+			io_trace_add('W', off, count, -err);
 			return -err;
+		}
 	}
 	if (g_fault2.monitored && off < g_fault2.end
 	    && off + count > g_fault2.start) {
 		int err = fault_hit(&g_fault2);
 
-		if (err)
+		if (err) {
+			io_trace_add('W', off, count, -err);
 			return -err;
+		}
 	}
 	r = pwrite(g_fd, buf, count, off);
 	g_nw++;
@@ -286,6 +391,7 @@ static int64_t io_pwrite(void *ctx, const void *buf, int64_t count, int64_t off)
 	if (count <= 65536)
 		g_nw_small++;
 	(void)ctx;
+	io_trace_add('W', off, count, r < 0 ? -errno : r);
 	return r < 0 ? -errno : r;
 }
 
@@ -1278,17 +1384,13 @@ static int ft_t6(ntfsb_device *dev, ntfsb_volume *v)
 }
 
 /*
- * Shared setup of t7/t7b: /d with 60 filler files (its $I30 index grows
- * into a non-resident allocation) and /d/a.bin with 4096 bytes, whose
- * directory entry must be updated when the write cache is flushed.
- * Also reads the committed $I30 index allocation range.
+ * Shared population of t7/t7b/t10: /d with 60 filler files (its $I30
+ * index grows into a non-resident allocation) and /d/a.bin with 4096
+ * bytes, whose directory entry must be updated when the write cache is
+ * flushed. The last file written stays dirty in the write cache.
  */
-static int ft_t7_setup(ntfsb_volume *v, uint64_t *dino, uint64_t *aino,
-		int64_t *rs, int64_t *re)
+static int ft_t7_populate(ntfsb_volume *v, uint64_t *dino, uint64_t *aino)
 {
-	ntfs_volume *h;
-	ntfs_inode *dni;
-	ntfs_attr *na;
 	ntfsb_stat st;
 	char name[16];
 	int r, i;
@@ -1323,6 +1425,23 @@ static int ft_t7_setup(ntfsb_volume *v, uint64_t *dino, uint64_t *aino,
 			return -1;
 		}
 	}
+	return 0;
+}
+
+/*
+ * t7/t7b setup: the population plus the committed $I30 index allocation
+ * range, read through the independent read-only helper mount.
+ */
+static int ft_t7_setup(ntfsb_volume *v, uint64_t *dino, uint64_t *aino,
+		int64_t *rs, int64_t *re)
+{
+	ntfs_volume *h;
+	ntfs_inode *dni;
+	ntfs_attr *na;
+	int r;
+
+	if (ft_t7_populate(v, dino, aino))
+		return -1;
 
 	/* the committed index allocation range, through the independent
 	 * read-only helper mount (nothing is hardcoded) */
@@ -1661,6 +1780,460 @@ static int ft_t9(ntfsb_device *dev, ntfsb_volume *v)
 	return ft_done(id);
 }
 
+/* ------------------------------------------------- t10: unaligned writes
+ *
+ * With a mount-time device I/O granularity larger than the $I30 index
+ * block (NTFSTOOL_IO_ALIGN), the index block writeback of the flush is
+ * an unaligned write: bdev_pwrite() read-modify-writes the surrounding
+ * units, and a failure of that PREFETCH READ never reaches the device
+ * as a write while ntfs_index_ctx_put() discards the write error
+ * anyway. Only the bridge's write error ledger can report it.
+ *
+ * Two passes with identical operation sequences on identical images:
+ *
+ *   record pass (on a copy of the image, no injection): locate the one
+ *   read-modify-write of the first sync that covers the target index
+ *   block, by its shape in the device I/O trace, and note the trace
+ *   position of its prefetch read;
+ *
+ *   formal pass (on the original image): the injector fails exactly
+ *   that prefetch read. The traces must agree everywhere else, which
+ *   also bounds the read-modify-write: none of it may run after the
+ *   failed read.
+ */
+struct ft_rmw {
+	unsigned long k;      /* trace position of the prefetch read */
+	int nent;             /* device ops of the read-modify-write */
+	int64_t start, end;   /* device range it covers */
+};
+
+/* Find read-modify-writes in trace range [s0, s1): the unaligned write
+ * of [start, end) appears as read(start, ss) -> write(start,
+ * end - start), preceded by read(end - ss, ss) when it spans two
+ * units. Those covering [rs, re) are counted; *out receives the last
+ * one found. A plain lookup read has the same shape as a prefetch
+ * read; only the immediately following write tells them apart. */
+static void ft_find_rmw(unsigned long s0, unsigned long s1, int64_t ss,
+		int64_t rs, int64_t re, struct ft_rmw *out, int *count)
+{
+	unsigned long i;
+	int n = 0;
+
+	for (i = s0; i + 1 < s1; i++) {
+		struct io_ev *e = &g_ev[i];
+		struct ft_rmw cand;
+
+		if (e->type != 'R' || e->off % ss || e->len != ss)
+			continue;
+		if (g_ev[i + 1].type == 'W' && g_ev[i + 1].off == e->off
+		    && g_ev[i + 1].len == ss) {
+			cand.nent = 2;
+			cand.start = e->off;
+			cand.end = e->off + ss;
+		} else if (i + 2 < s1 && g_ev[i + 1].type == 'R'
+			   && g_ev[i + 1].off == e->off + ss
+			   && g_ev[i + 1].len == ss
+			   && g_ev[i + 2].type == 'W'
+			   && g_ev[i + 2].off == e->off
+			   && g_ev[i + 2].len == 2 * ss) {
+			cand.nent = 3;
+			cand.start = e->off;
+			cand.end = e->off + 2 * ss;
+		} else {
+			continue;
+		}
+		cand.k = i + 1;
+		if (cand.start <= rs && re <= cand.end) {
+			n++;
+			*out = cand;
+		}
+	}
+	*count = n;
+}
+
+static void ft_print_trace(const char *id, const char *what,
+		unsigned long s0, unsigned long s1)
+{
+	unsigned long i;
+
+	printf("[%s] %s:\n", id, what);
+	for (i = s0; i < s1; i++)
+		printf("[%s]   IO %lu %c %lld +%lld => %lld\n", id, i + 1,
+			g_ev[i].type, (long long)g_ev[i].off,
+			(long long)g_ev[i].len, (long long)g_ev[i].ret);
+}
+
+static int ft_copy_image(const char *src, const char *dst)
+{
+	int in = open(src, O_RDONLY), out = -1, r = -1;
+	char buf[65536];
+
+	if (in < 0)
+		return -1;
+	out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (out < 0)
+		goto out;
+	for (;;) {
+		ssize_t n = read(in, buf, sizeof(buf)), w = 0;
+
+		if (n < 0)
+			goto out;
+		if (!n)
+			break;
+		while (w < n) {
+			ssize_t m = write(out, buf + w, n - w);
+
+			if (m < 0)
+				goto out;
+			w += m;
+		}
+	}
+	r = 0;
+out:
+	if (in >= 0)
+		close(in);
+	if (out >= 0)
+		close(out);
+	return r;
+}
+
+/* Point the device callbacks and the helper mount at another image
+ * file with the same content (the record pass works on a copy). */
+static int ft_image_swap(const char *path)
+{
+	int nfd = open(path, O_RDWR);
+
+	if (nfd < 0)
+		return -1;
+	if (g_fd >= 0)
+		close(g_fd);
+	g_fd = nfd;
+	g_image = path;
+	return 0;
+}
+
+/* Physical device range of the non-resident index block carrying /d's
+ * directory entry for a.bin, computed through the read-only helper
+ * mount: the flush must rewrite exactly this block. */
+static int ft_t10_block_range(uint64_t dino, int64_t *start, int64_t *end)
+{
+	ntfs_volume *h;
+	ntfs_inode *dni;
+	ntfs_attr *na = NULL;
+	ntfs_index_context *icx = NULL;
+	ntfschar *uname = NULL;
+	unsigned char keybuf[128];
+	FILE_NAME_ATTR *key;
+	runlist_element *rl;
+	s64 cs, inpos;
+	int ulen = 0, r = -1;
+
+	h = helper_mount();
+	if (!h)
+		return -1;
+	dni = ntfs_inode_open(h, dino);
+	na = dni ? ntfs_attr_open(dni, AT_INDEX_ALLOCATION, NTFS_INDEX_I30, 4)
+		 : NULL;
+	if (!na) {
+		fprintf(stderr, "flusftest: $I30 has no non-resident "
+			"index allocation\n");
+		goto out;
+	}
+	ulen = ntfs_mbstoucs("a.bin", &uname);
+	if (ulen < 0)
+		goto out;
+	icx = ntfs_index_ctx_get(dni, NTFS_INDEX_I30, 4);
+	/* the lookup key for COLLATION_FILE_NAME is a FILE_NAME_ATTR */
+	if (!icx)
+		goto out;
+	key = (FILE_NAME_ATTR *)keybuf;
+	memset(keybuf, 0, sizeof(keybuf));
+	key->file_name_length = ulen;
+	memcpy(key->file_name, uname, ulen * sizeof(ntfschar));
+	if (ntfs_index_lookup((char *)key, ulen, icx) || icx->is_in_root
+	    || !icx->ib) {
+		fprintf(stderr, "flusftest: the a.bin directory entry is "
+			"not in a non-resident index block\n");
+		goto out;
+	}
+	/* byte position of the block inside the index allocation */
+	inpos = (s64)sle64_to_cpu(icx->ib->index_block_vcn)
+		<< icx->vcn_size_bits;
+	cs = h->cluster_size;
+	if (ntfs_attr_map_whole_runlist(na))
+		goto out;
+	for (rl = na->rl; rl && rl->length; rl++) {
+		if (rl->lcn < 0)
+			continue;
+		if (inpos / cs >= rl->vcn && inpos / cs < rl->vcn + rl->length) {
+			*start = (rl->lcn + (inpos / cs - rl->vcn)) * cs
+				+ inpos % cs;
+			*end = *start + (s64)icx->block_size;
+			r = 0;
+			break;
+		}
+	}
+out:
+	if (icx)
+		ntfs_index_ctx_put(icx);
+	free(uname);
+	if (na)
+		ntfs_attr_close(na);
+	if (dni)
+		ntfs_inode_close(dni);
+	helper_umount(h);
+	return r;
+}
+
+/* Verify /d/a.bin through the bridge: size and the eight written
+ * pieces, before the unmount and again after a remount. */
+static void ft_t10_content(ntfsb_volume *v, const char *id, const char *when)
+{
+	unsigned char want[4096], got[4096];
+	ntfsb_stat st;
+	uint64_t ino;
+	char what[96], d[64];
+	int i, ok = 1, r;
+
+	for (i = 0; i < 8; i++)
+		ft_pattern(want + i * 512, 512, 0x0d0d0d + i);
+	r = resolve(v, "/d/a.bin", &ino, &st);
+	snprintf(what, sizeof(what), "a.bin resolves (%s)", when);
+	ft_assert(id, what, r == 0, ft_rc(r));
+	if (r)
+		return;
+	snprintf(d, sizeof(d), "got %llu", (unsigned long long)st.size);
+	snprintf(what, sizeof(what), "a.bin has the written size (%s)", when);
+	ft_assert(id, what, st.size == 4096, d);
+	if (ntfsb_read(v, ino, got, 4096, 0) != 4096
+	    || memcmp(got, want, 4096))
+		ok = 0;
+	snprintf(what, sizeof(what), "a.bin content survived (%s)", when);
+	ft_assert(id, what, ok, ok ? "" : "read back mismatch");
+}
+
+/* mode 0 = t10a: the prefetch read fails with -EIO.
+ * mode 1 = t10c: the prefetch read returns 0 bytes with a residual
+ *                ENOENT (short read).
+ * mode 2 = t10r: record pass only (the reachability check). */
+static int ft_t10(ntfsb_device *dev, ntfsb_volume *v, const char *id,
+		int mode)
+{
+	const int64_t ss = (int64_t)dev->sector_size;
+	struct ft_rmw rmw;
+	struct io_ev *recseg, *recpre;
+	const char *orig = g_image;
+	char recpath[4096], d[96];
+	uint64_t dino, aino;
+	ntfsb_volume *w;
+	int64_t rs, re, entry_size;
+	unsigned long s0, s1, f0, f1, rp, j, m;
+	int count, ur, in_allocation = 0, ok, r1, r2;
+
+	/* both passes must start from identical bytes: unmount the volume
+	 * main() mounted, then run the record pass on a copy */
+	ur = ntfsb_unmount(v);
+	ft_assert(id, "the initial mount unmounts cleanly", ur == 0,
+		ft_rc(ur));
+	snprintf(recpath, sizeof(recpath), "%s.rec", orig);
+	if (ft_copy_image(orig, recpath)) {
+		fprintf(stderr, "flusftest: cannot copy %s to %s\n", orig,
+			recpath);
+		return 1;
+	}
+	printf("[%s] device I/O granularity %lld; record pass on the copy "
+		"%s\n", id, (long long)ss, recpath);
+
+	/* ---- record pass ---- */
+	if (ft_image_swap(recpath))
+		return 1;
+	io_trace_reset();
+	w = ft_remount(dev);
+	if (ft_t7_populate(w, &dino, &aino)
+	    || ft_t10_block_range(dino, &rs, &re)) {
+		ntfsb_unmount(w);
+		return 1;
+	}
+	printf("[%s] target: /d $I30 index block of a.bin %lld..%lld "
+		"(%lld bytes)\n", id, (long long)rs, (long long)re,
+		(long long)(re - rs));
+	s0 = g_nev;
+	r1 = ntfsb_sync(w);
+	s1 = g_nev;
+	if (g_ev_overflow) {
+		/* events past the buffer were not stored: no trace to compare */
+		fprintf(stderr, "[%s] case not established: I/O trace overflow\n",
+			id);
+		return 1;
+	}
+	ft_assert(id, "the record sync returns 0", r1 == 0, ft_rc(r1));
+	ok = !g_ev_overflow;
+	for (j = 0; j < g_nev; j++)
+		if (g_ev[j].ret != g_ev[j].len)
+			ok = 0;
+	ft_assert(id, "every record-pass transfer completes in one call",
+		ok, ok ? "" : (g_ev_overflow ? "trace overflow" :
+		"short transfer present"));
+	ft_print_trace(id, "record: first sync device I/O", s0, s1);
+	count = 0;
+	ft_find_rmw(s0, s1, ss, rs, re, &rmw, &count);
+	snprintf(d, sizeof(d), "found %d", count);
+	ft_assert(id, "exactly one first-sync read-modify-write covers "
+		"the target index block", count == 1, d);
+	if (count != 1) {
+		fprintf(stderr, "flusftest: no unique covering "
+			"read-modify-write; is NTFSTOOL_IO_ALIGN larger "
+			"than the index block?\n");
+		ntfsb_unmount(w);
+		return ft_done(id);
+	}
+	rp = rmw.k - 1 - s0;
+	printf("[%s] read-modify-write covering the target: prefetch read "
+		"at IO %lu (off %lld, len %lld), %d ops, range %lld..%lld\n",
+		id, rmw.k, (long long)g_ev[rmw.k - 1].off,
+		(long long)g_ev[rmw.k - 1].len, rmw.nent, (long long)rmw.start,
+		(long long)rmw.end);
+	/* keep what the formal pass compares against, before its trace
+	 * replaces this one */
+	recseg = malloc((s1 - s0) * sizeof(*recseg));
+	recpre = malloc((rmw.k - 1) * sizeof(*recpre));
+	if (!recseg || !recpre) {
+		fprintf(stderr, "flusftest: out of memory\n");
+		free(recseg);
+		free(recpre);
+		ntfsb_unmount(w);
+		return 1;
+	}
+	memcpy(recseg, g_ev + s0, (s1 - s0) * sizeof(*recseg));
+	memcpy(recpre, g_ev, (rmw.k - 1) * sizeof(*recpre));
+	ur = ntfsb_unmount(w);
+	ft_assert(id, "the record pass unmounts cleanly", ur == 0,
+		ft_rc(ur));
+	if (mode == 2) {
+		free(recseg);
+		free(recpre);
+		return ft_done(id);
+	}
+
+	/* ---- formal pass ---- */
+	if (ft_image_swap(orig)) {
+		free(recseg);
+		free(recpre);
+		return 1;
+	}
+	io_trace_reset();
+	w = ft_remount(dev);
+	if (ft_t7_populate(w, &dino, &aino)) {
+		ntfsb_unmount(w);
+		free(recseg);
+		free(recpre);
+		return 1;
+	}
+	g_fault_k.armed = 1;
+	g_fault_k.k = rmw.k;
+	g_fault_k.is_read = 1;
+	g_fault_k.off = recseg[rp].off;
+	g_fault_k.len = recseg[rp].len;
+	g_fault_k.short_read = (mode == 1);
+	g_fault_k.hits = 0;
+	g_fault_k.mismatch = 0;
+	printf("[%s] injection armed: IO %lu R %lld +%lld -> %s\n", id,
+		rmw.k, (long long)recseg[rp].off, (long long)recseg[rp].len,
+		mode ? "0 bytes (short read, residual ENOENT)" : "-EIO");
+	f0 = g_nev;
+	r1 = ntfsb_sync(w);
+	f1 = g_nev;
+	if (g_ev_overflow) {
+		fprintf(stderr, "[%s] case not established: I/O trace overflow\n",
+			id);
+		return 1;
+	}
+
+	/* the formal pass must repeat the recorded I/O up to the read */
+	ok = 1;
+	for (j = 0; j + 1 < rmw.k; j++)
+		if (g_ev[j].type != recpre[j].type
+		    || g_ev[j].off != recpre[j].off
+		    || g_ev[j].len != recpre[j].len)
+			ok = 0;
+	ft_assert(id, "the formal pass repeats the recorded I/O up to the "
+		"failed read", ok, ok ? "" : "trace prefix differs");
+	snprintf(d, sizeof(d), "hits %d, mismatch %d", g_fault_k.hits,
+		g_fault_k.mismatch);
+	ft_assert(id, "the recorded prefetch read failed exactly once",
+		g_fault_k.hits == 1 && !g_fault_k.mismatch, d);
+	/* expected first-sync trace: the record trace minus the part of
+	 * the read-modify-write after the failed read */
+	ok = (f1 - f0 == (s1 - s0) - (rmw.nent - 1));
+	m = 0;
+	for (j = 0; j < s1 - s0 && ok; j++) {
+		if (j > rp && j < rp + rmw.nent)
+			continue;
+		if (m >= f1 - f0
+		    || g_ev[f0 + m].type != recseg[j].type
+		    || g_ev[f0 + m].off != recseg[j].off
+		    || g_ev[f0 + m].len != recseg[j].len)
+			ok = 0;
+		else
+			m++;
+	}
+	if (m != f1 - f0)
+		ok = 0;
+	snprintf(d, sizeof(d), "formal %lu ops, record %lu ops",
+		f1 - f0, s1 - s0);
+	ft_assert(id, "the first-sync trace equals the record trace minus "
+		"the tail of the failed read-modify-write", ok, d);
+	snprintf(d, sizeof(d), "got %lld", (long long)g_ev[rmw.k - 1].ret);
+	ft_assert(id, mode ? "the failed read returned 0 bytes"
+			 : "the failed read returned -EIO",
+		g_ev[rmw.k - 1].ret == (mode ? 0 : -EIO), d);
+	ok = 1;
+	for (j = f0; j < f1; j++)
+		if (j != rmw.k - 1 && g_ev[j].ret != g_ev[j].len)
+			ok = 0;
+	ft_assert(id, "every other formal transfer completes in one call",
+		ok, ok ? "" : "short transfer present");
+
+	r2 = ntfsb_sync(w);
+	ft_assert(id, mode ? "the first ntfsb_sync returns -EIO (not the "
+		"residual ENOENT)" : "the first ntfsb_sync returns -EIO",
+		r1 == -EIO, ft_rc(r1));
+	ft_assert(id, "the second ntfsb_sync returns 0", r2 == 0,
+		ft_rc(r2));
+	if (ft_t7_dir_entry(dino, &entry_size, &in_allocation)) {
+		ntfsb_unmount(w);
+		free(recseg);
+		free(recpre);
+		return 1;
+	}
+	snprintf(d, sizeof(d), "dir entry size %lld, want 4096",
+		(long long)entry_size);
+	ft_assert(id, "after the second sync the directory entry carries "
+		"the written size", entry_size == 4096, d);
+	ft_assert(id, "the entry lives in a non-resident index block",
+		in_allocation, in_allocation ? "" : "in the index root");
+	ft_t10_content(w, id, "before unmount");
+	ur = ntfsb_unmount(w);
+	ft_assert(id, "unmount returns 0", ur == 0, ft_rc(ur));
+	w = ft_remount(dev);
+	if (ft_t7_dir_entry(dino, &entry_size, &in_allocation)) {
+		ntfsb_unmount(w);
+		free(recseg);
+		free(recpre);
+		return 1;
+	}
+	snprintf(d, sizeof(d), "dir entry size %lld, want 4096",
+		(long long)entry_size);
+	ft_assert(id, "after the remount the directory entry still carries "
+		"the written size", entry_size == 4096, d);
+	ft_t10_content(w, id, "after remount");
+	ur = ntfsb_unmount(w);
+	ft_assert(id, "final unmount returns 0", ur == 0, ft_rc(ur));
+	free(recseg);
+	free(recpre);
+	return ft_done(id);
+}
+
 static int flushtest(ntfsb_device *dev, ntfsb_volume *v, const char *name)
 {
 	if (!strcmp(name, "t1"))
@@ -1683,7 +2256,13 @@ static int flushtest(ntfsb_device *dev, ntfsb_volume *v, const char *name)
 		return ft_t7b(dev, v);
 	if (!strcmp(name, "t9"))
 		return ft_t9(dev, v);
-	fprintf(stderr, "ntfstool: unknown flushtest case %s (t1-t9)\n", name);
+	if (!strcmp(name, "t10a"))
+		return ft_t10(dev, v, "t10a", 0);
+	if (!strcmp(name, "t10c"))
+		return ft_t10(dev, v, "t10c", 1);
+	if (!strcmp(name, "t10r"))
+		return ft_t10(dev, v, "t10r", 2);
+	fprintf(stderr, "ntfstool: unknown flushtest case %s (t1-t10)\n", name);
 	return 64;
 }
 
@@ -1745,6 +2324,7 @@ int main(int argc, char **argv)
 	dev.pwrite = ro ? NULL : io_pwrite;
 	dev.sync = io_sync;
 	dev.read_only = ro;
+	g_io_trace = getenv("NTFSTOOL_IO_TRACE") != NULL;
 	if (S_ISBLK(hst.st_mode) || S_ISCHR(hst.st_mode)) {
 		ioctl(g_fd, DKIOCGETBLOCKSIZE, &bsize);
 		ioctl(g_fd, DKIOCGETBLOCKCOUNT, &bcount);
@@ -1779,6 +2359,27 @@ int main(int argc, char **argv)
 		r = ntfsm_check(&dev, !strcmp(cmd, "repair"), maint_out, NULL);
 		printf("%s: %d\n", cmd, r);
 		return r ? 1 : 0;
+	}
+
+	/* Mount-time device I/O granularity for the unaligned write-path
+	 * cases: the mounted bridge reports a larger block size, while the
+	 * format and check invocations above keep the natural sector size
+	 * of the image (the NTFS sector size inside the image comes from
+	 * its boot sector and is unaffected either way). */
+	{
+		const char *s = getenv("NTFSTOOL_IO_ALIGN");
+
+		if (s && *s) {
+			long a = strtol(s, NULL, 0);
+
+			if (a < 512 || a > (1L << 20) || (a & (a - 1))) {
+				fprintf(stderr,
+					"ntfstool: invalid NTFSTOOL_IO_ALIGN %s\n",
+					s);
+				return 64;
+			}
+			dev.sector_size = (uint32_t)a;
+		}
 	}
 
 	v = do_mount(&dev, ro ? NTFSB_MOUNT_RDONLY : 0);

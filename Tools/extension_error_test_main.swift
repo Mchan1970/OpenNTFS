@@ -44,6 +44,21 @@ struct ExtensionErrorTest {
                    "unloadResource afterwards returns 0, no double report (got \(unload))")
         }
 
+        runTest("S1b unmount handoff in the observed callback order") {
+            // Every unmount path seen on a live system (Finder eject,
+            // diskutil unmount/eject, menu eject, unplugging) runs
+            // unmount -> synchronize -> deactivateVolume, and
+            // unloadResource does not run.
+            let s = VolumeErrorState()
+            s.record(-EIO)                    // unmount: its final sync failed
+            let sync = s.boundary(0)          // synchronize after unmount
+            expect(sync == EIO,
+                   "the synchronize after unmount reports the EIO (got \(sync))")
+            let deactivate = s.boundary(0)    // deactivateVolume
+            expect(deactivate == 0,
+                   "deactivateVolume afterwards returns 0, no double report (got \(deactivate))")
+        }
+
         runTest("S2 ledger priority") {
             let s = VolumeErrorState()
             s.record(-EIO)                    // unreported EIO in the ledger

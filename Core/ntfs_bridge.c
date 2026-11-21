@@ -158,9 +158,10 @@ struct bdev {
 	ntfsb_device io;
 	s64 pos;
 	/*
-	 * Errno of the last failed device write, recorded because
-	 * ntfs_inode_sync_in_dir() collapses every non-EIO write error
-	 * into EBUSY and the real reason would be lost otherwise.
+	 * Errno of the last failed device write (including a failed
+	 * prefetch of the read-modify-write in bdev_pwrite), recorded
+	 * because ntfs_inode_sync_in_dir() collapses every non-EIO write
+	 * error into EBUSY and the real reason would be lost otherwise.
 	 */
 	int last_werr;
 };
@@ -244,16 +245,18 @@ static s64 bdev_pwrite(struct ntfs_device *dev, const void *buf, s64 count,
 {
 	struct bdev *b = BDEV(dev);
 	const s64 ss = b->io.sector_size;
-	s64 start, end, put;
+	s64 start, end, put, got;
 	char *bounce;
 
 	if (NDevReadOnly(dev)) {
+		b->last_werr = EROFS;
 		errno = EROFS;
 		return -1;
 	}
 	if (count <= 0)
 		return 0;
 	if (offset < 0) {
+		b->last_werr = EINVAL;
 		errno = EINVAL;
 		return -1;
 	}
@@ -266,16 +269,27 @@ static s64 bdev_pwrite(struct ntfs_device *dev, const void *buf, s64 count,
 	end = ((offset + count + ss - 1) / ss) * ss;
 	bounce = malloc(end - start);
 	if (!bounce) {
+		b->last_werr = ENOMEM;
 		errno = ENOMEM;
 		return -1;
 	}
-	if (bdev_xfer(b, bounce, ss, start, 0) != ss
-	    || ((end - start > ss)
-		&& bdev_xfer(b, bounce + (end - start) - ss, ss, end - ss, 0)
-				!= ss)) {
+	got = bdev_xfer(b, bounce, ss, start, 0);
+	if (got == ss && end - start > ss)
+		got = bdev_xfer(b, bounce + (end - start) - ss, ss,
+				end - ss, 0);
+	if (got != ss) {
 		free(bounce);
-		if (!errno)
+		/* A negative return is a real device error and errno is
+		 * the one to report. A short prefetch read (0 bytes or
+		 * less than a unit) has no errno of its own; a residual
+		 * value from an earlier call must not leak into callers.
+		 * Either way the write never reached the device, and
+		 * upstream may discard the error (ntfs_index_ctx_put
+		 * drops failed index block writes), so last_werr has to
+		 * carry it for the error ledger. */
+		if (got >= 0)
 			errno = EIO;
+		b->last_werr = errno;
 		return -1;
 	}
 	memcpy(bounce + (offset - start), buf, count);

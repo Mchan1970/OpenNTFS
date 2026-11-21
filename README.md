@@ -5,7 +5,7 @@ Read-write NTFS for macOS 27+ on Apple silicon, built as an FSKit file system ex
 [libntfs-3g](https://github.com/tuxera/ntfs-3g); this project adds a C bridge,
 the FSKit module and a menu bar app.
 
-Status: 0.2.1 is an early release. It has been tested on a single Mac
+Status: 0.2.2 is an early release. It has been tested on a single Mac
 (macOS 27.2) with a USB flash drive and with disk images. Other kinds of
 disks (external SSDs, hard drives) have not been tested, and no performance
 measurements have been made. Back up important data.
@@ -172,11 +172,27 @@ temporary directory, or recording stubs, and do not touch real disks,
   failed commit attempt itself may already have written part of the
   metadata. Reads, and further writes to the file whose commit failed,
   continue. Errors are
-  delivered through the `synchronize`, `deactivateVolume` and
-  `unloadResource` callbacks; FSKit's `unmount` callback has no error
-  channel, so an error found there is reported by the next of those three.
-- If the commit still fails at unmount, the pending update is dropped and
-  the error is reported; the disk may then hold partially committed
+  delivered through the `synchronize` and `deactivateVolume` callbacks
+  (and `unloadResource`, if FSKit calls it). FSKit's `unmount` callback has
+  no error channel. On every way of unmounting tried on macOS 27.2 (Finder
+  eject, `diskutil unmount` / `eject`, the app's eject, unplugging) FSKit
+  called `synchronize` and then `deactivateVolume` after `unmount`, so an
+  error found at unmount is reported by the next of those; `unloadResource`
+  was not seen. How Finder or `diskutil` show such an error has not been
+  tested.
+- When FSKit asks OpenNTFS to sync the volume, every pending data and
+  metadata write is handed to the disk driver, and the sync reports success
+  only after those writes have returned. On macOS 27.2, `fsync` and
+  `fcntl(F_FULLFSYNC)` each caused such a sync before returning, and an
+  eject runs one too. FSKit gives a file system extension no way to flush
+  the disk's own write cache, so `F_FULLFSYNC` is no stronger than `fsync`
+  here. Eject before unplugging. In tests with a Lenovo Thinkplus
+  USB flash drive, a 64 MiB file copied with `cp` was intact after the
+  drive was unplugged without ejecting about 8 s after `cp` returned, and
+  Windows found the volume clean; other drives may hold writes in their
+  cache for longer.
+- If the commit still fails when the volume is finally closed, the pending
+  update is dropped and the error is reported; the disk may then hold partially committed
   metadata. Run chkdsk on Windows before using the volume there.
 - If giving back space that was allocated ahead fails part way, the volume
   fails closed: every write, every operation above and every sync returns
@@ -187,11 +203,16 @@ temporary directory, or recording stubs, and do not touch real disks,
   each sync attempt can leak one inode of that parent directory (memory
   only, no data damage). The leaked memory is only returned when the file
   system extension process exits.
-- Verify / repair is ntfsfix, not a full chkdsk. After a **repair**, Windows
-  may ask to "scan and fix" the drive the next time it is plugged in. This is
-  intended: like upstream ntfsfix, the repair marks the volume dirty so that
-  Windows runs its full chkdsk once. Let it scan. (A verify does not set the
-  flag.)
+- Verify / repair is ntfsfix, not a full chkdsk. Repair on a volume that
+  OpenNTFS has mounted read-write first runs a verify; if that finds
+  nothing, ntfsfix is not run in write mode and the app says so (if the
+  verify could not confirm that device permissions were restored, the app
+  reports that and does not repair either). Otherwise (the verify finds a
+  problem, or the volume is read-only or not mounted) the repair runs and,
+  like upstream ntfsfix, tries to mark the volume dirty so that Windows
+  checks it: on the test drive, Windows then offered to "scan and fix" the
+  drive, a read-only chkdsk left it dirty and `chkdsk /f` cleared it. Let
+  Windows scan. (A verify does not set the flag.)
 - The app's interface is in Simplified Chinese when the first language in
   the system's preferred languages is any Chinese variant, and in English
   otherwise.

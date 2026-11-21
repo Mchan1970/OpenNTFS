@@ -44,6 +44,7 @@ final class NTFSVolume: FSVolume {
 
     private var handle: OpaquePointer?
     private let device: BlockDevice
+    private let bsdName: String
     private var items: [UInt64: NTFSItem] = [:]
     /// Flush/release error handoff state; every access
     /// happens under `Core.sync`, like the bridge calls it dispatches.
@@ -59,6 +60,7 @@ final class NTFSVolume: FSVolume {
     init(handle: OpaquePointer, device: BlockDevice) {
         self.handle = handle
         self.device = device
+        self.bsdName = device.resource.bsdName
         var info = ntfsb_info()
         ntfsb_get_info(handle, &info)
         isReadOnly = info.read_only != 0
@@ -326,13 +328,13 @@ extension NTFSVolume: FSVolume.Handler {
 
     func activateVolume(options: FSTaskOptions,
                         replyHandler reply: @escaping (FSActivateResult?, (any Error)?) -> Void) {
-        log.info("activate")
+        log.info("activate \(self.bsdName, privacy: .public)")
         reply(FSActivateResult(rootItem: root), nil)
     }
 
     func deactivateVolume(options: FSDeactivateOptions,
                           replyHandler reply: @escaping ((any Error)?) -> Void) {
-        log.info("deactivate")
+        log.info("deactivate \(self.bsdName, privacy: .public) options=\(options.rawValue)")
         var syncError: Int32 = 0
         Core.sync {
             if let h = handle {
@@ -341,20 +343,22 @@ extension NTFSVolume: FSVolume.Handler {
                 syncError = errorState.boundary(ntfsb_sync(h))
             }
         }
+        log.info("deactivate \(self.bsdName, privacy: .public) reply errno=\(syncError)")
         reply(syncError == 0 ? nil : posixError(syncError))
     }
 
     func mount(options: FSTaskOptions, replyHandler reply: @escaping ((any Error)?) -> Void) {
-        log.info("mount \(options.taskOptions, privacy: .public)")
+        log.info("mount \(options.taskOptions, privacy: .public) \(self.bsdName, privacy: .public)")
         reply(nil)
     }
 
     func unmount(replyHandler reply: @escaping () -> Void) {
-        log.info("unmount")
+        log.info("unmount \(self.bsdName, privacy: .public)")
         Core.sync {
             if let h = handle {
                 releasePending(h)
                 let r = ntfsb_sync(h)
+                log.info("unmount \(self.bsdName, privacy: .public) sync=\(r)")
                 if r != 0 {
                     log.error("unmount sync failed: \(r)")
                     // no error channel here: whichever of synchronize,
@@ -368,13 +372,14 @@ extension NTFSVolume: FSVolume.Handler {
     }
 
     func synchronize(flags: FSSyncFlags, replyHandler reply: @escaping ((any Error)?) -> Void) {
-        log.info("synchronize")
+        log.info("synchronize \(self.bsdName, privacy: .public) flags=\(flags.rawValue)")
         let r: Int32 = Core.sync {
             guard let h = handle else { return 0 }
             releasePending(h)
             // reporting boundary: a stored error outranks this attempt
             return errorState.boundary(ntfsb_sync(h))
         }
+        log.info("synchronize \(self.bsdName, privacy: .public) reply errno=\(r)")
         reply(r == 0 ? nil : posixError(r))
     }
 

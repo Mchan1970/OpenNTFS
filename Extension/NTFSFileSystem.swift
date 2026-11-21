@@ -12,6 +12,10 @@ final class NTFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
     override init() {
         super.init()
         _ = Core.installLogging
+        let info = Bundle.main.infoDictionary
+        let version = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info?["CFBundleVersion"] as? String ?? "?"
+        log.info("init pid=\(getpid(), privacy: .public) version=\(version, privacy: .public) build=\(build, privacy: .public)")
     }
 
     // MARK: Probe
@@ -46,7 +50,7 @@ final class NTFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
         let opts = options.taskOptions.flatMap { $0.split(separator: ",").map(String.init) }
         let wantReadOnly = opts.contains { ["--rdonly", "rdonly", "ro", "-r"].contains($0) }
         let force = opts.contains("-f")
-        log.info("loading \(block.bsdName, privacy: .public) options \(options.taskOptions, privacy: .public)")
+        log.info("loading \(block.bsdName, privacy: .public) options \(options.taskOptions, privacy: .public) pid=\(getpid(), privacy: .public)")
         self.resource = block
 
         let device = BlockDevice(resource: block, readOnly: wantReadOnly)
@@ -80,10 +84,11 @@ final class NTFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
 
     func unloadResource(resource: FSResource, options: FSTaskOptions,
                         replyHandler reply: @escaping ((any Error)?) -> Void) {
-        log.info("unloading")
+        log.info("unloading \(self.resource?.bsdName ?? "-", privacy: .public)")
         let status = volume?.shutdown() ?? 0
         volume = nil
         self.resource = nil
+        log.info("unloading reply errno=\(status)")
         reply(status == 0 ? nil : posixError(status))
     }
 

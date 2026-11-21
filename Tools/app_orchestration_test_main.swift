@@ -1130,6 +1130,191 @@ func testEAggregation() async throws {
     }
 }
 
+// MARK: - F. Repair precheck on a read-write volume (no write when clean)
+
+// A: read-write mounted + clean precheck → the flow must run exactly ONE
+// read-only (-q) fsck, never ask for a write grant, and report the
+// no-repair-needed wording. Code that repairs unconditionally fails this
+// (it runs -y on a volume the read-only check just cleared).
+func testFRepairPrecheckCleanSkipsWrite() async throws {
+    let shell = ScriptedShell([
+        .init("/usr/sbin/diskutil", ["unmount", dev]),                 // flow unmounts FIRST
+        .init("/sbin/fsck_fskit", ["-t", "openntfs", "-q", dev]),      // read-only precheck
+        .init("/usr/sbin/diskutil", ["mount", dev]),                   // policy RW remount
+    ])
+    shell.install()
+    let probe = ScriptedProbe([
+        .unmounted,                                    // precheck before-check gate
+        .unmounted,                                    // remount initial state
+        mounted("/Volumes/TestDisk", readOnly: false), // mount verify
+        mounted("/Volumes/TestDisk", readOnly: false), // final mode verify
+    ])
+    probe.install()
+    let helper = ScriptedHelper()
+    let text = await Mounter(helper: helper)
+        .runMaintenanceFlow(makeDisk(mounted: true, ours: true, readOnly: false), repair: true)
+    expect(shell.fsckCalls.count == 1
+           && shell.fsckCalls[0].args.contains("-q")
+           && !shell.fsckCalls[0].args.contains("-y"),
+           "exactly one fsck, the read-only precheck: \(shell.calls)")
+    expect(!shell.calls.contains { $0.args.contains("-y") },
+           "a clean read-only precheck must not be followed by -y: \(shell.calls)")
+    expect(helper.preps.isEmpty, "no helper grant on a clean precheck: \(helper.preps)")
+    expect(text.contains("no repair needed") || text.contains("未发现需要修复的问题"),
+           "no-repair-needed wording present: \(text)")
+}
+
+// B: read-write mounted + precheck FAILS (-q exit 8) → exactly one -y
+// repair pass follows, reported with the repair-finished wording.
+func testFRepairPrecheckFailedRunsRepair() async throws {
+    let shell = ScriptedShell([
+        .init("/usr/sbin/diskutil", ["unmount", dev]),
+        .init("/sbin/fsck_fskit", ["-t", "openntfs", "-q", dev], status: 8,
+              output: "corrupt metadata"),
+        .init("/sbin/fsck_fskit", ["-t", "openntfs", "-y", dev], status: 0, output: ""),
+        .init("/usr/sbin/diskutil", ["mount", dev]),
+    ])
+    shell.install()
+    let probe = ScriptedProbe([
+        .unmounted,                                   // precheck gate
+        .unmounted,                                   // repair gate
+        .unmounted,                                   // remount initial state
+        mounted("/Volumes/TestDisk", readOnly: false), // mount verify
+        mounted("/Volumes/TestDisk", readOnly: false), // final mode verify
+    ])
+    probe.install()
+    let helper = ScriptedHelper()
+    let text = await Mounter(helper: helper)
+        .runMaintenanceFlow(makeDisk(mounted: true, ours: true, readOnly: false), repair: true)
+    let yCalls = shell.fsckCalls.filter { $0.args.contains("-y") }
+    expect(yCalls.count == 1, "exactly one -y after the failed precheck: \(shell.calls)")
+    expect(shell.fsckCalls.count == 2, "precheck then repair, nothing else: \(shell.calls)")
+    expect(helper.preps.isEmpty, "direct path needs no helper: \(helper.preps)")
+    expect(text.contains("repair finished") || text.contains("修复完成"),
+           "repair-finished wording: \(text)")
+    expect(text.contains("Windows"), "repair-finished text carries the Windows scan note: \(text)")
+}
+
+// C: read-only mounted and NOT-mounted volumes do NOT precheck — one -y
+// directly (the direct-repair behavior for volumes whose mount state
+// proves nothing about log replay / hibernation cleanup).
+func testFRepairReadOnlyMountedRunsRepairDirectly() async throws {
+    let shell = ScriptedShell([
+        .init("/usr/sbin/diskutil", ["unmount", dev]),
+        .init("/sbin/fsck_fskit", ["-t", "openntfs", "-y", dev], status: 0, output: ""),
+        .init("/usr/sbin/diskutil", ["mount", "readOnly", dev]),
+    ])
+    shell.install()
+    let probe = ScriptedProbe([
+        .unmounted,                                 // repair gate
+        .unmounted,                                 // remount initial state
+        mounted("/Volumes/TestDisk", readOnly: true), // post-mount verify
+    ])
+    probe.install()
+    let helper = ScriptedHelper()
+    let text = await Mounter(helper: helper)
+        .runMaintenanceFlow(makeDisk(mounted: true, ours: true, readOnly: true), repair: true)
+    expect(shell.fsckCalls.count == 1 && shell.fsckCalls[0].args.contains("-y"),
+           "no precheck on a read-only mount; one -y directly: \(shell.calls)")
+    expect(!shell.calls.contains { $0.args.contains("-q") },
+           "no read-only precheck may run: \(shell.calls)")
+    expect(text.contains("repair finished") || text.contains("修复完成"),
+           "repair-finished wording: \(text)")
+}
+
+func testFRepairNotMountedRunsRepairDirectly() async throws {
+    let shell = ScriptedShell([
+        .init("/sbin/fsck_fskit", ["-t", "openntfs", "-y", dev], status: 0, output: ""),
+    ])
+    shell.install()
+    let probe = ScriptedProbe([.unmounted])   // repair gate
+    probe.install()
+    let helper = ScriptedHelper()
+    let text = await Mounter(helper: helper)
+        .runMaintenanceFlow(makeDisk(mounted: false, ours: true, readOnly: false), repair: true)
+    expect(shell.fsckCalls.count == 1 && shell.fsckCalls[0].args.contains("-y"),
+           "no precheck when not mounted; one -y directly: \(shell.calls)")
+    expect(!shell.calls.contains { $0.args.contains("-q") },
+           "no read-only precheck may run: \(shell.calls)")
+    expect(text.contains("repair finished") || text.contains("修复完成"),
+           "repair-finished wording: \(text)")
+}
+
+// D: read-write mounted + precheck takes the helper path (first -q EPERM,
+// read-only grant, second -q ok) but the permission restore FAILS → zero
+// -y, the warning is preserved alongside the no-repair-needed result.
+func testFRepairPrecheckRestoreFailureSkipsWriteKeepsWarning() async throws {
+    let shell = ScriptedShell([
+        .init("/usr/sbin/diskutil", ["unmount", dev]),
+        .init("/sbin/fsck_fskit", ["-t", "openntfs", "-q", dev], status: 13, output: epermOutput),
+        .init("/sbin/fsck_fskit", ["-t", "openntfs", "-q", dev], status: 0, output: ""),
+        .init("/usr/sbin/diskutil", ["mount", dev]),
+    ])
+    shell.install()
+    let probe = ScriptedProbe([
+        .unmounted,                                    // precheck gate 1
+        .unmounted,                                    // gate 2 (before-prepare)
+        .unmounted,                                    // gate 3 (before-fsck-escalated)
+        .unmounted,                                    // remount initial state
+        mounted("/Volumes/TestDisk", readOnly: false), // mount verify
+        mounted("/Volumes/TestDisk", readOnly: false), // final mode verify
+    ])
+    probe.install()
+    let helper = ScriptedHelper([
+        .prepare(devicePath: dev, writeAccess: false),
+        .restore(devicePath: dev, error: "restore EIO"),
+    ])
+    let text = await Mounter(helper: helper)
+        .runMaintenanceFlow(makeDisk(mounted: true, ours: true, readOnly: false), repair: true)
+    expect(!shell.calls.contains { $0.args.contains("-y") },
+           "a warned precheck must not be followed by -y: \(shell.calls)")
+    expect(helper.preps.count == 1 && helper.preps[0].writeAccess == false,
+           "the precheck grant is read-only: \(helper.preps)")
+    expect(helper.restores.count == 1, "one restore attempt: \(helper.restores)")
+    expect(text.contains("restore EIO"), "restore warning preserved: \(text)")
+    expect(text.contains("unconfirmed") || text.contains("未确认"),
+           "neutral unconfirmed wording: \(text)")
+    expect(text.contains("no repair needed") || text.contains("未发现需要修复的问题"),
+           "no-repair-needed wording present: \(text)")
+}
+
+// D2: as D, but the escalated precheck itself fails: the restore warning
+// still wins over the repair, so no -y runs.
+func testFRepairPrecheckFailedWithRestoreFailureSkipsWrite() async throws {
+    let shell = ScriptedShell([
+        .init("/usr/sbin/diskutil", ["unmount", dev]),
+        .init("/sbin/fsck_fskit", ["-t", "openntfs", "-q", dev], status: 13, output: epermOutput),
+        .init("/sbin/fsck_fskit", ["-t", "openntfs", "-q", dev], status: 8, output: "volume has corrupt metadata"),
+        .init("/usr/sbin/diskutil", ["mount", dev]),
+    ])
+    shell.install()
+    let probe = ScriptedProbe([
+        .unmounted,                                    // precheck gate 1
+        .unmounted,                                    // gate 2 (before-prepare)
+        .unmounted,                                    // gate 3 (before-fsck-escalated)
+        .unmounted,                                    // remount initial state
+        mounted("/Volumes/TestDisk", readOnly: false), // mount verify
+        mounted("/Volumes/TestDisk", readOnly: false), // final mode verify
+    ])
+    probe.install()
+    let helper = ScriptedHelper([
+        .prepare(devicePath: dev, writeAccess: false),
+        .restore(devicePath: dev, error: "restore EIO"),
+    ])
+    let text = await Mounter(helper: helper)
+        .runMaintenanceFlow(makeDisk(mounted: true, ours: true, readOnly: false), repair: true)
+    expect(!shell.calls.contains { $0.args.contains("-y") },
+           "a warned precheck must not be followed by -y: \(shell.calls)")
+    expect(helper.preps.count == 1 && helper.preps[0].writeAccess == false,
+           "the precheck grant is read-only: \(helper.preps)")
+    expect(helper.restores.count == 1, "one restore attempt: \(helper.restores)")
+    expect(text.contains("restore EIO"), "restore warning preserved: \(text)")
+    expect(text.contains("unconfirmed") || text.contains("未确认"),
+           "neutral unconfirmed wording: \(text)")
+    expect(text.contains("volume has corrupt metadata"),
+           "the failed precheck result is reported: \(text)")
+}
+
 // MARK: - Main
 
 // MARK: - Deliberate-violation self-checks (run in SEPARATE processes)
@@ -1422,6 +1607,14 @@ enum AppOrchestrationTestMain {
         await runTest("dStopMountCommandFailedKeepsOriginalError (D-a)", testDStopMountCommandFailedKeepsOriginalError)
         await runTest("dStopQueryFailedReportsUnknownState (D-b)", testDStopQueryFailedReportsUnknownState)
         await runTest("E_aggregation", testEAggregation)
+        await runTest("F_repairPrecheckCleanSkipsWrite", testFRepairPrecheckCleanSkipsWrite)
+        await runTest("F_repairPrecheckFailedRunsRepair", testFRepairPrecheckFailedRunsRepair)
+        await runTest("F_repairReadOnlyMountedRunsRepairDirectly", testFRepairReadOnlyMountedRunsRepairDirectly)
+        await runTest("F_repairNotMountedRunsRepairDirectly", testFRepairNotMountedRunsRepairDirectly)
+        await runTest("F_repairPrecheckRestoreFailureSkipsWriteKeepsWarning",
+                      testFRepairPrecheckRestoreFailureSkipsWriteKeepsWarning)
+        await runTest("F_repairPrecheckFailedWithRestoreFailureSkipsWrite",
+                      testFRepairPrecheckFailedWithRestoreFailureSkipsWrite)
         print("app-orchestration tests finished: \(failures) failure(s)")
         exit(failures == 0 ? 0 : 1)
     }
